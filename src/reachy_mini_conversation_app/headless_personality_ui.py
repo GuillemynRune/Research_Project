@@ -12,9 +12,8 @@ import logging
 from typing import Any, Callable, Optional
 
 from fastapi import FastAPI
-
+from local_conversation_handler import LocalConversationHandler as OpenaiRealtimeHandler
 from .config import config
-from .openai_realtime import OpenaiRealtimeHandler
 from .headless_personality import (
     DEFAULT_OPTION,
     _sanitize_name,

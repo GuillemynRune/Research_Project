@@ -1,4 +1,4 @@
-"""Entrypoint for the Reachy Mini conversation app."""
+"""Entrypoint for the Reachy Mini conversation app - Modified for local models support."""
 
 import os
 import sys
@@ -42,15 +42,31 @@ def run(
     instance_path: Optional[str] = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
-    # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
+    # Import config to check which handler to use
+    from reachy_mini_conversation_app.config import config
+    
+    # Putting these dependencies here makes the dashboard faster to load
     from reachy_mini_conversation_app.moves import MovementManager
     from reachy_mini_conversation_app.console import LocalStream
-    from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
+    
+    # Show which mode we're using
+    if config.USE_LOCAL_MODELS:
+        logger.info("=" * 60)
+        logger.info("USING LOCAL MODELS")
+        logger.info(f"  Whisper: {config.WHISPER_MODEL}")
+        logger.info(f"  Gemma 3 VLM: {config.GEMMA_MODEL}")
+        logger.info(f"  (Vision-Language Model - handles both text and images)")
+        logger.info("=" * 60)
+    else:
+        logger.info("=" * 60)
+        logger.info("USING OPENAI API")
+        logger.info(f"  Model: {config.MODEL_NAME}")
+        logger.info("=" * 60)
 
     if args.no_camera and args.head_tracker is not None:
         logger.warning(
@@ -114,6 +130,7 @@ def run(
         vision_manager=vision_manager,
         head_wobbler=head_wobbler,
     )
+    
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     logger.debug(f"Current file absolute path: {current_file_path}")
     chatbot = gr.Chatbot(
@@ -126,15 +143,26 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    # Choose handler based on configuration
+    if config.USE_LOCAL_MODELS:
+        logger.info("Initializing LOCAL conversation handler")
+        from local_conversation_handler import LocalConversationHandler
+        handler = LocalConversationHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+        # Head wobbler not needed for local models (no streaming audio from LLM)
+        head_wobbler.stop()
+    else:
+        logger.info("Initializing OPENAI conversation handler")
+        from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
+        handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
     if args.gradio:
         api_key_textbox = gr.Textbox(
-            label="OPENAI API Key",
+            label="OPENAI API Key" if not config.USE_LOCAL_MODELS else "API Key (not used with local models)",
             type="password",
             value=os.getenv("OPENAI_API_KEY") if not get_space() else "",
+            visible=not config.USE_LOCAL_MODELS,  # Hide if using local models
         )
 
         from reachy_mini_conversation_app.gradio_personality import PersonalityUI
@@ -153,7 +181,7 @@ def run(
             ],
             additional_outputs=[chatbot],
             additional_outputs_handler=update_chatbot,
-            ui_args={"title": "Talk with Reachy Mini"},
+            ui_args={"title": "Talk with Reachy Mini (Local Models)" if config.USE_LOCAL_MODELS else "Talk with Reachy Mini"},
         )
         stream_manager = stream.ui
         if not settings_app:
@@ -173,9 +201,10 @@ def run(
             instance_path=instance_path,
         )
 
-    # Each async service → its own thread/loop
+    # Start async services
     movement_manager.start()
-    head_wobbler.start()
+    if not config.USE_LOCAL_MODELS:  # Only use head wobbler with OpenAI streaming
+        head_wobbler.start()
     if camera_worker:
         camera_worker.start()
     if vision_manager:
@@ -201,7 +230,8 @@ def run(
         logger.info("Keyboard interruption in main thread... closing server.")
     finally:
         movement_manager.stop()
-        head_wobbler.stop()
+        if not config.USE_LOCAL_MODELS:
+            head_wobbler.stop()
         if camera_worker:
             camera_worker.stop()
         if vision_manager:
@@ -231,9 +261,6 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
         asyncio.set_event_loop(loop)
 
         args, _ = parse_args()
-
-        # is_wireless = reachy_mini.client.get_status()["wireless_version"]
-        # args.head_tracker = None if is_wireless else "mediapipe"
 
         instance_path = self._get_instance_path().parent
         run(

@@ -20,16 +20,28 @@ else:
 class Config:
     """Configuration class for the conversation app."""
 
-    # Required
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
-
-    # Optional
+    # Model backend selection
+    USE_LOCAL_MODELS = os.getenv("USE_LOCAL_MODELS", "true").lower() in ("true", "1", "yes")
+    
+    # OpenAI settings (only used if USE_LOCAL_MODELS=false)
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime")
+    
+    # Local model settings (used if USE_LOCAL_MODELS=true)
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")  # tiny, base, small, medium, large
+    GEMMA_MODEL = os.getenv("GEMMA_MODEL", "google/gemma-3-4b-it")  # Gemma 3 VLM
+    
+    # Optional: HuggingFace settings for local models
     HF_HOME = os.getenv("HF_HOME", "./cache")
-    LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
-    HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
+    HF_TOKEN = os.getenv("HF_TOKEN")  # Required for Gemma 3
 
-    logger.debug(f"Model: {MODEL_NAME}, HF_HOME: {HF_HOME}, Vision Model: {LOCAL_VISION_MODEL}")
+    # TTS settings
+    TTS_ENGINE = os.getenv("TTS_ENGINE", "none")  # none, piper, coqui, bark
+    TTS_MODEL = os.getenv("TTS_MODEL", "")
+    
+    logger.debug(f"USE_LOCAL_MODELS: {USE_LOCAL_MODELS}")
+    logger.debug(f"Whisper Model: {WHISPER_MODEL}, Gemma 3 VLM: {GEMMA_MODEL}")
+    logger.debug(f"HF_HOME: {HF_HOME}")
 
     REACHY_MINI_CUSTOM_PROFILE = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
     logger.debug(f"Custom Profile: {REACHY_MINI_CUSTOM_PROFILE}")
@@ -39,11 +51,7 @@ config = Config()
 
 
 def set_custom_profile(profile: str | None) -> None:
-    """Update the selected custom profile at runtime and expose it via env.
-
-    This ensures modules that read `config` and code that inspects the
-    environment see a consistent value.
-    """
+    """Update the selected custom profile at runtime and expose it via env."""
     try:
         config.REACHY_MINI_CUSTOM_PROFILE = profile
     except Exception:
@@ -54,7 +62,6 @@ def set_custom_profile(profile: str | None) -> None:
         if profile:
             _os.environ["REACHY_MINI_CUSTOM_PROFILE"] = profile
         else:
-            # Remove to reflect default
             _os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
     except Exception:
         pass
