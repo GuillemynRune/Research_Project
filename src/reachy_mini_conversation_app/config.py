@@ -28,7 +28,7 @@ class Config:
     MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime")
     
     # Local model settings (used if USE_LOCAL_MODELS=true)
-    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")  # tiny, base, small, medium, large
+    WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")  # tiny, base, small, medium, large
     GEMMA_MODEL = os.getenv("GEMMA_MODEL", "google/gemma-3-4b-it")  # Gemma 3 VLM
     
     # Optional: HuggingFace settings for local models

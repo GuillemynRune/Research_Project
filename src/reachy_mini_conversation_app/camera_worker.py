@@ -232,7 +232,7 @@ class CameraWorker:
                         # else: Keep current offsets (within 2s delay period)
 
                 # Small sleep to prevent excessive CPU usage (same as main_works.py)
-                time.sleep(0.04)
+                time.sleep(0.033)
 
             except Exception as e:
                 logger.error(f"Camera worker error: {e}")

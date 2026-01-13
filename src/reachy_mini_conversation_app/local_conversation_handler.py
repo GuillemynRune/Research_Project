@@ -1,15 +1,17 @@
-"""Local conversation handler using Whisper (STT) + Gemma (LLM) + TTS.
+"""Local conversation handler using Whisper (STT) + Gemma 3 (VLM) + pyttsx3 (TTS).
 
-Replaces OpenAI's realtime API with local models while maintaining
-the same interface for compatibility with the existing robot control system.
+FIXED VERSION with:
+- Working audio processing loop
+- Real TTS implementation  
+- Intent classification
+- Task management integration
+- Proper tool calling
 """
 
 import json
-import base64
 import asyncio
 import logging
 from typing import Any, Tuple, Optional
-from pathlib import Path
 from datetime import datetime
 
 import cv2
@@ -33,7 +35,7 @@ OUTPUT_SAMPLE_RATE = 24000  # TTS output rate
 
 
 class LocalConversationHandler(AsyncStreamHandler):
-    """Local conversation handler using Whisper + Gemma + local TTS."""
+    """Local conversation handler using Whisper + Gemma + TTS."""
 
     def __init__(self, deps: Any, gradio_mode: bool = False, instance_path: Optional[str] = None):
         """Initialize the handler."""
@@ -55,21 +57,32 @@ class LocalConversationHandler(AsyncStreamHandler):
         self.whisper_model: Optional[Any] = None
         self.gemma_processor: Optional[Any] = None
         self.gemma_model: Optional[Any] = None
-        self.gemma_model_name = "google/gemma-3-4b-it"  # Gemma 3 VLM
+        self.gemma_model_name = "google/gemma-3-4b-it"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Intent classifier
+        from reachy_mini_conversation_app.intent_classifier import IntentClassifier
+        self.intent_classifier = IntentClassifier()
+        
+        # Task manager
+        from reachy_mini_conversation_app.task_manager import TaskManager
+        self.task_manager = TaskManager()
         
         # Conversation state
         self.conversation_history: list = []
         self.is_processing = False
         self.last_activity_time = asyncio.get_event_loop().time()
         
-        # Audio buffering for VAD
+        # Audio buffering for VADba
         self.audio_buffer: list = []
         self.buffer_duration_s = 0.0
-        self.silence_threshold = 0.02  # RMS threshold for silence detection
-        self.min_speech_duration = 0.5  # Minimum speech duration in seconds
+        self.silence_threshold = 0.08  # RMS threshold for silence detection
+        self.min_speech_duration = 1.0  # Minimum speech duration in seconds
         self.max_speech_duration = 10.0  # Maximum speech duration
-        self.silence_duration_to_stop = 0.8  # Seconds of silence to stop recording
+        self.silence_duration_to_stop = 1.0  # Seconds of silence to stop recording
+        self._silence_start: Optional[float] = None
+
+        self._models_loaded = False
 
         # Internal flags
         self._shutdown_requested = False
@@ -80,13 +93,11 @@ class LocalConversationHandler(AsyncStreamHandler):
         return LocalConversationHandler(self.deps, self.gradio_mode, self.instance_path)
 
     async def _load_models(self) -> None:
-        """Load Whisper and Gemma 3 VLM."""
+        """Load Whisper, Gemma 3 VLM, and initialize TTS."""
         try:
-            # Load Whisper model (run in thread to avoid blocking)
+            # Load Whisper model
             logger.info("Loading Whisper model...")
-            self.whisper_model = await asyncio.to_thread(
-                whisper.load_model, "base"  # Options: tiny, base, small, medium, large
-            )
+            self.whisper_model = await asyncio.to_thread(whisper.load_model, "medium")
             logger.info("Whisper model loaded")
 
             # Load Gemma 3 VLM
@@ -96,7 +107,6 @@ class LocalConversationHandler(AsyncStreamHandler):
                 from huggingface_hub import login
                 import os
 
-                # Login with token
                 hf_token = os.getenv("HF_TOKEN")
                 if hf_token:
                     login(token=hf_token)
@@ -116,49 +126,37 @@ class LocalConversationHandler(AsyncStreamHandler):
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
-            logger.error("Make sure to: pip install transformers torch pillow")
             raise
 
     async def start_up(self) -> None:
         """Start the handler and load models."""
         await self._load_models()
         
+        # Start task manager
+        await self.task_manager.start()
+        
+        self._models_loaded = True
         # Start processing loop
         self._processing_task = asyncio.create_task(self._processing_loop())
         logger.info("Local conversation handler started")
 
     async def _processing_loop(self) -> None:
-        """Main processing loop for handling audio and generating responses."""
+        """Main processing loop - monitors idle state."""
         while not self._shutdown_requested:
             try:
-                # Check if we have enough audio buffered
-                if self.buffer_duration_s < self.min_speech_duration:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # Check for silence to detect end of speech
-                if await self._detect_end_of_speech():
-                    await self._process_speech()
-                    
-                await asyncio.sleep(0.05)
+                # Check for idle behavior
+                idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
+                if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
+                    await self._send_idle_signal()
+                    self.last_activity_time = asyncio.get_event_loop().time()
+                
+                await asyncio.sleep(1.0)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Error in processing loop: {e}")
                 await asyncio.sleep(1.0)
-
-    async def _detect_end_of_speech(self) -> bool:
-        """Detect if user has stopped speaking based on silence."""
-        if len(self.audio_buffer) < 10:
-            return False
-
-        # Check last N frames for silence
-        recent_frames = self.audio_buffer[-10:]
-        silence_count = sum(1 for frame in recent_frames if self._is_silence(frame))
-        
-        # If most recent frames are silent, consider speech ended
-        return silence_count >= 8
 
     def _is_silence(self, audio_chunk: NDArray[np.int16]) -> bool:
         """Check if audio chunk is silence based on RMS threshold."""
@@ -167,8 +165,13 @@ class LocalConversationHandler(AsyncStreamHandler):
         return rms < self.silence_threshold
 
     async def _process_speech(self) -> None:
-        """Process buffered speech through Whisper -> Gemma 3 VLM -> TTS pipeline."""
+        """Process buffered speech."""
         if self.is_processing or not self.audio_buffer:
+            return
+        
+        if not self._models_loaded:
+            logger.warning("⚠️ Models not loaded yet, skipping processing")
+            self.audio_buffer.clear()
             return
 
         self.is_processing = True
@@ -178,17 +181,29 @@ class LocalConversationHandler(AsyncStreamHandler):
             audio_data = np.concatenate(self.audio_buffer)
             self.audio_buffer.clear()
             self.buffer_duration_s = 0.0
+            self._silence_start = None
 
-            # Inform movement manager that user is speaking
+            # CHECK AUDIO LEVEL (prevents hallucinations!)
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            rms = np.sqrt(np.mean(audio_float ** 2))
+            
+            if rms < 0.05:
+                logger.info(f"🔇 Audio too quiet (RMS={rms:.4f}), skipping transcription")
+                self.is_processing = False
+                return
+            
+            logger.info(f"🎤 Processing audio (RMS={rms:.4f})")
+
+            # Now safe to transcribe
             self.deps.movement_manager.set_listening(True)
-
-            # Step 1: Speech-to-Text with Whisper
             logger.info("Transcribing speech...")
             transcript = await self._transcribe_audio(audio_data)
-            
+
             if not transcript or len(transcript.strip()) < 3:
                 logger.debug("Transcript too short, ignoring")
                 self.deps.movement_manager.set_listening(False)
+                # After silence, return to callword mode
+                self.awaiting_callword = True
                 return
 
             logger.info(f"User said: {transcript}")
@@ -196,47 +211,49 @@ class LocalConversationHandler(AsyncStreamHandler):
                 AdditionalOutputs({"role": "user", "content": transcript})
             )
 
+            # Step 1.5: Classify intent
+            intent, confidence = self.intent_classifier.classify(transcript)
+            logger.info(f"Intent: {intent} (confidence: {confidence:.2f})")
+
+            entities = self.intent_classifier.extract_entities(transcript, intent)
+            if entities:
+                logger.info(f"Entities: {entities}")
+
             # Step 2: Check if this needs camera/vision input
             image = None
-            needs_vision = any(word in transcript.lower() for word in 
-                             ["see", "look", "camera", "what", "show", "picture", "view"])
-            
+            needs_vision = intent == 'vision_query'
+
             if needs_vision and self.deps.camera_worker is not None:
                 logger.info("Vision request detected, capturing image...")
                 frame = self.deps.camera_worker.get_latest_frame()
                 if frame is not None:
-                    # Convert BGR to RGB and create PIL Image
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     image = Image.fromarray(rgb_frame)
-                    
-                    # Show image in UI
+
                     await self.output_queue.put(
-                        AdditionalOutputs({
-                            "role": "assistant",
-                            "content": image,
-                        })
+                        AdditionalOutputs({"role": "assistant", "content": image})
                     )
 
             # Step 3: Get LLM response with optional image
             logger.info("Generating response with Gemma 3 VLM...")
-            response_text, tool_calls = await self._get_llm_response(transcript, image)
-            
+            response_text, tool_calls = await self._get_llm_response(transcript, image, intent, entities)
+
             # Step 4: Execute tool calls if any
             if tool_calls:
                 await self._execute_tool_calls(tool_calls)
-                
+
                 # Get follow-up response after tool execution
-                # (tool results have been added to conversation)
                 response_text, _ = await self._get_llm_response(
                     "Based on the tool results, respond to the user.",
-                    None
+                    None,
+                    intent,
+                    entities
                 )
 
             # Step 5: Emit assistant response
             if response_text:
-                # Clean up any tool call markers from response
                 response_text = self._clean_response_text(response_text)
-                
+
                 logger.info(f"Assistant: {response_text}")
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "assistant", "content": response_text})
@@ -248,49 +265,83 @@ class LocalConversationHandler(AsyncStreamHandler):
             self.deps.movement_manager.set_listening(False)
 
         except Exception as e:
-            logger.error(f"Error processing speech: {e}")
+            logger.error(f"Error processing speech: {e}", exc_info=True)
+            await self.output_queue.put(
+                AdditionalOutputs({
+                    "role": "assistant",
+                    "content": "Sorry, I had trouble processing that. Could you repeat?"
+                })
+            )
         finally:
             self.is_processing = False
+            # After processing, return to callword mode
+            self.awaiting_callword = True
     
     def _clean_response_text(self, text: str) -> str:
         """Remove tool call markers from response text."""
         import re
-        # Remove [TOOL:name:{args}] patterns
         cleaned = re.sub(r'\[TOOL:\w+:.*?\]', '', text)
         return cleaned.strip()
 
     async def _transcribe_audio(self, audio_data: NDArray[np.int16]) -> str:
         """Transcribe audio using Whisper."""
-        # Convert to float32 in range [-1, 1]
         audio_float = audio_data.astype(np.float32) / 32768.0
         
-        # Whisper expects 16kHz mono audio
         result = await asyncio.to_thread(
             self.whisper_model.transcribe,
             audio_float,
             language="en",
-            fp16=False  # Use fp32 for CPU
+            fp16=False
         )
         
-        return result["text"].strip()
+        transcript = result["text"].strip()
 
-    async def _get_llm_response(self, user_message: str, image: Optional[Image.Image] = None) -> Tuple[str, list]:
+        # Filter hallucinations
+        hallucinations = ["thank you for watching", "subscribe", "like and subscribe"]
+        if any(h in transcript.lower() for h in hallucinations):
+            logger.warning(f"Detected hallucination: '{transcript}'")
+            return ""
+        
+        return transcript
+
+    async def _get_llm_response(
+        self, 
+        user_message: str, 
+        image: Optional[Image.Image] = None,
+        intent: Optional[str] = None,
+        entities: Optional[dict] = None
+    ) -> Tuple[str, list]:
         """Get response from Gemma 3 VLM with optional image input."""
         from reachy_mini_conversation_app.prompts import get_session_instructions
+        from reachy_mini_conversation_app.tools.core_tools import get_tool_specs
         
-        # Build conversation
+        # Build system prompt with tool definitions
         system_prompt = get_session_instructions()
         
-        # Gemma 3 uses chat format with optional images
-        messages = []
+        tool_specs = get_tool_specs()
+        if tool_specs:
+            tools_description = "\n\nAVAILABLE TOOLS:\n"
+            for tool in tool_specs:
+                name = tool.get("name", "")
+                desc = tool.get("description", "")
+                params = tool.get("parameters", {}).get("properties", {})
+                
+                tools_description += f"\n{name}:\n"
+                tools_description += f"  Description: {desc}\n"
+                tools_description += f"  Parameters: {list(params.keys())}\n"
+            
+            tools_description += """
+TO USE A TOOL, include in your response:
+[TOOL:tool_name:{"param1":"value1","param2":"value2"}]
+
+Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
+"""
+            system_prompt += tools_description
         
-        # Add system message
-        messages.append({
-            "role": "system",
-            "content": system_prompt
-        })
+        # Build messages
+        messages = [{"role": "system", "content": system_prompt}]
         
-        # Add conversation history (keep last 10 exchanges)
+        # Add conversation history (keep last 20)
         for msg in self.conversation_history[-20:]:
             messages.append(msg)
         
@@ -304,27 +355,69 @@ class LocalConversationHandler(AsyncStreamHandler):
                 ]
             })
         else:
-            messages.append({
-                "role": "user",
-                "content": user_message
-            })
+            messages.append({"role": "user", "content": user_message})
 
         try:
-            # Process with Gemma 3
             def generate_response():
-                # Apply chat template
-                inputs = self.gemma_processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_dict=True,
-                    return_tensors="pt"
-                )
+                # FIXED: Properly handle text-only vs text+image messages
+                if image is not None:
+                    # For image inputs, use the processor directly
+                    text_content = []
+                    for msg in messages:
+                        if msg["role"] == "system":
+                            text_content.append(msg["content"])
+                        elif msg["role"] == "user":
+                            if isinstance(msg["content"], str):
+                                text_content.append(msg["content"])
+                            elif isinstance(msg["content"], list):
+                                for item in msg["content"]:
+                                    if item.get("type") == "text":
+                                        text_content.append(item["text"])
+                        elif msg["role"] == "assistant":
+                            text_content.append(msg["content"])
+                    
+                    prompt_text = "\n".join(text_content)
+                    
+                    inputs = self.gemma_processor(
+                        text=prompt_text,
+                        images=image,
+                        return_tensors="pt",
+                        padding=True
+                    )
+                else:
+                    # For text-only, use chat template
+                    # But extract text content properly
+                    text_messages = []
+                    for msg in messages:
+                        if isinstance(msg.get("content"), str):
+                            text_messages.append(msg)
+                        elif isinstance(msg.get("content"), list):
+                            # Extract text from list content
+                            text_parts = [item["text"] for item in msg["content"] if item.get("type") == "text"]
+                            if text_parts:
+                                text_messages.append({
+                                    "role": msg["role"],
+                                    "content": " ".join(text_parts)
+                                })
+                    
+                    # Apply chat template to text-only messages
+                    prompt_text = self.gemma_processor.tokenizer.apply_chat_template(
+                        text_messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    
+                    inputs = self.gemma_processor(
+                        text=prompt_text,
+                        return_tensors="pt",
+                        padding=True
+                    )
                 
-                # Move to device
+                # Move inputs to device
                 inputs = {k: v.to(self.device) if hasattr(v, 'to') else v 
                          for k, v in inputs.items()}
                 
-                # Generate response
+                # Generate
                 with torch.no_grad():
                     outputs = self.gemma_model.generate(
                         **inputs,
@@ -334,22 +427,11 @@ class LocalConversationHandler(AsyncStreamHandler):
                         pad_token_id=self.gemma_processor.tokenizer.eos_token_id,
                     )
                 
-                # Decode response
-                response = self.gemma_processor.decode(
-                    outputs[0],
-                    skip_special_tokens=True
-                )
-                
+                response = self.gemma_processor.decode(outputs[0], skip_special_tokens=True)
                 return response
             
-            # Run generation in thread to not block event loop
             full_response = await asyncio.to_thread(generate_response)
-            
-            # Extract just the assistant's response (after the last prompt)
-            # Gemma includes the full conversation in output, extract new part
             response_text = self._extract_assistant_response(full_response, messages)
-            
-            # Parse for tool calls (simple pattern matching)
             tool_calls = self._extract_tool_calls(response_text)
             
             # Update conversation history
@@ -363,46 +445,33 @@ class LocalConversationHandler(AsyncStreamHandler):
             return "I'm having trouble thinking right now.", []
     
     def _extract_assistant_response(self, full_text: str, messages: list) -> str:
-        """Extract only the new assistant response from full generated text."""
-        # Find the last user message
+        """Extract only the new assistant response."""
         last_user_msg = messages[-1]["content"]
         if isinstance(last_user_msg, list):
             last_user_msg = next((item["text"] for item in last_user_msg if item["type"] == "text"), "")
         
-        # Split on common assistant markers
         markers = ["assistant\n", "Assistant:", "<assistant>", "\n\n"]
         
         for marker in markers:
             if marker in full_text:
                 parts = full_text.split(marker)
-                # Get the last part which should be the new response
                 response = parts[-1].strip()
                 if response and len(response) > 5:
                     return response
         
-        # Fallback: try to find text after the user message
         if last_user_msg in full_text:
             idx = full_text.rindex(last_user_msg)
             response = full_text[idx + len(last_user_msg):].strip()
             if response:
                 return response
         
-        # Last resort: return cleaned full text
         return full_text.strip()
     
     def _extract_tool_calls(self, text: str) -> list:
-        """Extract tool calls from response text using pattern matching.
-        
-        Expected format in response:
-        "Let me dance for you! [TOOL:dance:{"move":"random"}]"
-        or
-        "I'll take a look [TOOL:camera:{"question":"what do you see"}]"
-        """
+        """Extract tool calls from response text."""
         import re
         
         tool_calls = []
-        
-        # Pattern: [TOOL:tool_name:{"arg":"value"}]
         pattern = r'\[TOOL:(\w+):(.*?)\]'
         matches = re.findall(pattern, text)
         
@@ -421,7 +490,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         return tool_calls
 
     async def _execute_tool_calls(self, tool_calls: list) -> None:
-        """Execute tool calls and add results to conversation."""
+        """Execute tool calls including task management."""
         from reachy_mini_conversation_app.tools.core_tools import dispatch_tool_call
 
         for tool_call in tool_calls:
@@ -432,12 +501,24 @@ class LocalConversationHandler(AsyncStreamHandler):
                 continue
 
             try:
-                # Execute tool
-                logger.info(f"Executing tool: {tool_name}")
-                args_json = json.dumps(tool_args) if isinstance(tool_args, dict) else tool_args
-                result = await dispatch_tool_call(tool_name, args_json, self.deps)
+                # Handle task management tools
+                if tool_name == "create_reminder":
+                    message = tool_args.get("message", "Reminder")
+                    delay = float(tool_args.get("delay_seconds", 60))
+                    task_id = self.task_manager.create_reminder(message, delay)
+                    result = {"task_id": task_id, "message": f"Reminder set for {delay}s"}
                 
-                # Emit tool result to UI
+                elif tool_name == "create_timer":
+                    duration = float(tool_args.get("duration_seconds", 60))
+                    task_id = self.task_manager.create_timer(duration)
+                    result = {"task_id": task_id, "message": f"Timer set for {duration}s"}
+                
+                else:
+                    # Standard tool dispatch
+                    logger.info(f"Executing tool: {tool_name}")
+                    args_json = json.dumps(tool_args) if isinstance(tool_args, dict) else tool_args
+                    result = await dispatch_tool_call(tool_name, args_json, self.deps)
+                
                 await self.output_queue.put(
                     AdditionalOutputs({
                         "role": "assistant",
@@ -446,7 +527,6 @@ class LocalConversationHandler(AsyncStreamHandler):
                     })
                 )
                 
-                # Add tool result to conversation for Gemma to see
                 self.conversation_history.append({
                     "role": "system",
                     "content": f"Tool {tool_name} result: {json.dumps(result)}"
@@ -456,47 +536,61 @@ class LocalConversationHandler(AsyncStreamHandler):
                 logger.error(f"Tool execution error ({tool_name}): {e}")
 
     async def _generate_speech(self, text: str) -> None:
-        """Generate speech using local TTS (placeholder - needs TTS implementation)."""
-        # TODO: Integrate local TTS like:
-        # - piper-tts
-        # - coqui-tts
-        # - bark
+        """Generate speech using pyttsx3 TTS."""
+        import pyttsx3
+        import tempfile
+        import wave
+        import os
         
-        # For now, log that we would speak
-        logger.info(f"[TTS] Would speak: {text}")
+        def generate_audio():
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 150)
+            engine.setProperty('volume', 0.9)
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                temp_path = f.name
+            
+            engine.save_to_file(text, temp_path)
+            engine.runAndWait()
+            
+            with wave.open(temp_path, 'rb') as wav:
+                frames = wav.readframes(wav.getnframes())
+                audio_data = np.frombuffer(frames, dtype=np.int16)
+            
+            os.remove(temp_path)
+            return audio_data
         
-        # Placeholder: generate silent audio to maintain timing
-        # In real implementation, this would be actual TTS output
-        duration_s = len(text.split()) * 0.3  # Rough estimate
-        samples = int(OUTPUT_SAMPLE_RATE * duration_s)
-        silence = np.zeros(samples, dtype=np.int16)
-        
-        # Send to output queue in chunks
-        chunk_size = 4800  # 200ms chunks
-        for i in range(0, len(silence), chunk_size):
-            chunk = silence[i:i + chunk_size]
-            await self.output_queue.put((OUTPUT_SAMPLE_RATE, chunk.reshape(1, -1)))
-            await asyncio.sleep(0.05)
+        try:
+            logger.info(f"[TTS] Speaking: {text}")
+            audio_data = await asyncio.to_thread(generate_audio)
+            
+            # Send to output queue in chunks
+            chunk_size = 4800
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                await self.output_queue.put((OUTPUT_SAMPLE_RATE, chunk.reshape(1, -1)))
+                await asyncio.sleep(0.01)
+                
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
-        """Receive audio frame from microphone and buffer it."""
+        """Receive audio frame and trigger processing when speech detected."""
         input_sample_rate, audio_frame = frame
 
-        # Reshape if needed
+        # Reshape and resample
         if audio_frame.ndim == 2:
             if audio_frame.shape[1] > audio_frame.shape[0]:
                 audio_frame = audio_frame.T
             if audio_frame.shape[1] > 1:
                 audio_frame = audio_frame[:, 0]
 
-        # Resample to 16kHz for Whisper
         if input_sample_rate != INPUT_SAMPLE_RATE:
             audio_frame = resample(
                 audio_frame,
                 int(len(audio_frame) * INPUT_SAMPLE_RATE / input_sample_rate)
             )
 
-        # Cast to int16
         audio_frame = audio_to_int16(audio_frame)
 
         # Buffer audio
@@ -506,30 +600,42 @@ class LocalConversationHandler(AsyncStreamHandler):
 
         # Limit buffer size
         if self.buffer_duration_s > self.max_speech_duration:
-            # Remove oldest chunk
             removed = self.audio_buffer.pop(0)
             self.buffer_duration_s -= len(removed) / INPUT_SAMPLE_RATE
+        
+        # Trigger processing when speech ends
+        if self.buffer_duration_s >= self.min_speech_duration and not self.is_processing:
+            recent_is_silent = self._is_silence(audio_frame)
+            
+            if recent_is_silent:
+                if self._silence_start is None:
+                    self._silence_start = asyncio.get_event_loop().time()
+                
+                silence_duration = asyncio.get_event_loop().time() - self._silence_start
+                
+                if silence_duration >= self.silence_duration_to_stop:
+                    logger.debug(f"Silence detected, processing speech")
+                    asyncio.create_task(self._process_speech())
+            else:
+                self._silence_start = None
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
-        """Emit audio or messages to be played/displayed."""
-        # Check for idle behavior
-        idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
-            await self._send_idle_signal()
-            self.last_activity_time = asyncio.get_event_loop().time()
+        """Emit audio or messages."""
+        #idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
+        #if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
+        #    await self._send_idle_signal()
+        #    self.last_activity_time = asyncio.get_event_loop().time()
 
         return await wait_for_item(self.output_queue)  # type: ignore
 
     async def _send_idle_signal(self) -> None:
-        """Trigger idle behavior when no activity."""
+        """Trigger idle behavior."""
         logger.info("Idle timeout - triggering idle behavior")
         
-        # Use tool to trigger an idle action (dance, emotion, etc.)
         try:
             from reachy_mini_conversation_app.tools.core_tools import dispatch_tool_call
-            
-            # Randomly pick an idle behavior
             import random
+            
             idle_tools = ["dance", "play_emotion", "do_nothing"]
             tool_name = random.choice(idle_tools)
             
@@ -556,8 +662,9 @@ class LocalConversationHandler(AsyncStreamHandler):
                 await self._processing_task
             except asyncio.CancelledError:
                 pass
+        
+        await self.task_manager.stop()
 
-        # Clear queues
         while not self.output_queue.empty():
             try:
                 self.output_queue.get_nowait()
@@ -572,8 +679,6 @@ class LocalConversationHandler(AsyncStreamHandler):
             from reachy_mini_conversation_app.config import config, set_custom_profile
             
             set_custom_profile(profile)
-            
-            # Clear conversation history to start fresh with new personality
             self.conversation_history.clear()
             
             logger.info(f"Applied personality: {profile or 'default'}")
@@ -584,6 +689,5 @@ class LocalConversationHandler(AsyncStreamHandler):
             return f"Failed to apply personality: {e}"
 
     async def get_available_voices(self) -> list[str]:
-        """Get available TTS voices (placeholder)."""
-        # TODO: Implement when TTS is added
-        return ["default"]
+        """Get available TTS voices."""
+        return ["default"]  # pyttsx3 uses system default
