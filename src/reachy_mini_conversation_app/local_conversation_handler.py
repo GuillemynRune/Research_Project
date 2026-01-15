@@ -22,7 +22,7 @@ from scipy.signal import resample
 
 # Local model imports
 import torch
-import whisper
+#import whisper
 from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
 
@@ -76,10 +76,10 @@ class LocalConversationHandler(AsyncStreamHandler):
         # Audio buffering for VADba
         self.audio_buffer: list = []
         self.buffer_duration_s = 0.0
-        self.silence_threshold = 0.08  # RMS threshold for silence detection
-        self.min_speech_duration = 1.0  # Minimum speech duration in seconds
+        self.silence_threshold = 0.03  # RMS threshold for silence detection
+        self.min_speech_duration = 0.5  # Minimum speech duration in seconds
         self.max_speech_duration = 10.0  # Maximum speech duration
-        self.silence_duration_to_stop = 1.0  # Seconds of silence to stop recording
+        self.silence_duration_to_stop = 0.6  # Seconds of silence to stop recording
         self._silence_start: Optional[float] = None
 
         self._models_loaded = False
@@ -95,10 +95,16 @@ class LocalConversationHandler(AsyncStreamHandler):
     async def _load_models(self) -> None:
         """Load Whisper, Gemma 3 VLM, and initialize TTS."""
         try:
-            # Load Whisper model
-            logger.info("Loading Whisper model...")
-            self.whisper_model = await asyncio.to_thread(whisper.load_model, "medium")
-            logger.info("Whisper model loaded")
+            # Load Faster-Whisper model
+            logger.info("Loading Faster-Whisper model...")
+            from faster_whisper import WhisperModel
+            self.whisper_model = await asyncio.to_thread(
+                WhisperModel,
+                "base",  # or "small", "medium" - base is fastest
+                device="cuda",
+                compute_type="float16"
+            )
+            logger.info("Faster-Whisper model loaded")
 
             # Load Gemma 3 VLM
             logger.info(f"Loading Gemma 3 VLM: {self.gemma_model_name} on {self.device}")
@@ -162,7 +168,18 @@ class LocalConversationHandler(AsyncStreamHandler):
         """Check if audio chunk is silence based on RMS threshold."""
         audio_float = audio_chunk.astype(np.float32) / 32768.0
         rms = np.sqrt(np.mean(audio_float ** 2))
-        return rms < self.silence_threshold
+        
+        # Lower threshold = more sensitive (triggers on quieter sounds)
+        # Higher threshold = less sensitive (only triggers on louder sounds)
+        threshold = 0.02  # Adjust this if needed
+
+        is_silent = rms < threshold
+        
+        # Log occasionally for debugging
+        if np.random.random() < 0.01:  # Log 1% of the time
+            logger.debug(f"Audio RMS: {rms:.4f} (threshold: {threshold}, silent: {is_silent})")
+        
+        return is_silent
 
     async def _process_speech(self) -> None:
         """Process buffered speech."""
@@ -284,24 +301,40 @@ class LocalConversationHandler(AsyncStreamHandler):
         return cleaned.strip()
 
     async def _transcribe_audio(self, audio_data: NDArray[np.int16]) -> str:
-        """Transcribe audio using Whisper."""
+        """Transcribe audio using Faster-Whisper."""
         audio_float = audio_data.astype(np.float32) / 32768.0
         
-        result = await asyncio.to_thread(
-            self.whisper_model.transcribe,
-            audio_float,
-            language="en",
-            fp16=False
-        )
+        # Normalize audio
+        audio_float = audio_float / (np.max(np.abs(audio_float)) + 1e-8)
         
-        transcript = result["text"].strip()
-
-        # Filter hallucinations
-        hallucinations = ["thank you for watching", "subscribe", "like and subscribe"]
-        if any(h in transcript.lower() for h in hallucinations):
-            logger.warning(f"Detected hallucination: '{transcript}'")
+        def transcribe():
+            segments, info = self.whisper_model.transcribe(
+                audio_float,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
+            return " ".join([segment.text for segment in segments]).strip()
+        
+        transcript = await asyncio.to_thread(transcribe)
+        
+        # Require at least 3 words
+        word_count = len(transcript.split())
+        if word_count < 3:
+            logger.info(f"⚠️ Too short ({word_count} words): '{transcript}'")
             return ""
         
+        # WAKE WORD CHECK - Only process if "reachy" is mentioned
+        transcript_lower = transcript.lower()
+        wake_words = ["reachy", "richie", "reach", "reiki", "ricky"]
+        has_wake_word = any(word in transcript_lower for word in wake_words)
+        
+        if not has_wake_word:
+            logger.info(f"⏭️  No wake word: '{transcript}' - IGNORED")
+            return ""
+        
+        logger.info(f"✅ Wake word detected: '{transcript}'")
         return transcript
 
     async def _get_llm_response(
@@ -419,13 +452,23 @@ Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
                 
                 # Generate
                 with torch.no_grad():
-                    outputs = self.gemma_model.generate(
+                    torch_version = tuple(int(x) for x in torch.__version__.split('+')[0].split('.'))
+                    
+                    gen_kwargs = {
                         **inputs,
-                        max_new_tokens=200,
-                        temperature=0.7,
-                        do_sample=True,
-                        pad_token_id=self.gemma_processor.tokenizer.eos_token_id,
-                    )
+                        "max_new_tokens": 200,
+                        "temperature": 0.7,
+                        "do_sample": True,
+                        "pad_token_id": self.gemma_processor.tokenizer.eos_token_id,
+                    }
+                    
+                    # Only add attention_mask if PyTorch >= 2.6
+                    if torch_version >= (2, 6, 0):
+                        # These features require PyTorch 2.6+
+                        pass
+                    
+                    outputs = self.gemma_model.generate(**gen_kwargs)
+                 
                 
                 response = self.gemma_processor.decode(outputs[0], skip_special_tokens=True)
                 return response
@@ -576,6 +619,9 @@ Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive audio frame and trigger processing when speech detected."""
+        if not self._models_loaded:
+            return  # Don't buffer if models aren't ready
+        
         input_sample_rate, audio_frame = frame
 
         # Reshape and resample
@@ -593,6 +639,9 @@ Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
 
         audio_frame = audio_to_int16(audio_frame)
 
+        # Check if this chunk has speech
+        is_silent = self._is_silence(audio_frame)
+        
         # Buffer audio
         self.audio_buffer.append(audio_frame)
         chunk_duration = len(audio_frame) / INPUT_SAMPLE_RATE
@@ -603,21 +652,24 @@ Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
             removed = self.audio_buffer.pop(0)
             self.buffer_duration_s -= len(removed) / INPUT_SAMPLE_RATE
         
-        # Trigger processing when speech ends
-        if self.buffer_duration_s >= self.min_speech_duration and not self.is_processing:
-            recent_is_silent = self._is_silence(audio_frame)
-            
-            if recent_is_silent:
+        # Speech detection logic
+        if not is_silent:
+            # Speech detected - reset silence timer
+            self._silence_start = None
+            logger.debug("🎤 Speech detected")
+        else:
+            # Silence detected
+            if self.buffer_duration_s >= self.min_speech_duration:
                 if self._silence_start is None:
                     self._silence_start = asyncio.get_event_loop().time()
+                    logger.debug("🔇 Silence started")
                 
                 silence_duration = asyncio.get_event_loop().time() - self._silence_start
                 
-                if silence_duration >= self.silence_duration_to_stop:
-                    logger.debug(f"Silence detected, processing speech")
+                # Trigger processing after enough silence
+                if silence_duration >= self.silence_duration_to_stop and not self.is_processing:
+                    logger.info(f"💬 Processing speech ({self.buffer_duration_s:.1f}s)")
                     asyncio.create_task(self._process_speech())
-            else:
-                self._silence_start = None
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio or messages."""
