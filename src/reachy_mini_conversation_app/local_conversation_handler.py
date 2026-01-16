@@ -14,6 +14,10 @@ import logging
 from typing import Any, Tuple, Optional
 from datetime import datetime
 
+import httpx
+import base64
+import io
+
 import cv2
 import numpy as np
 from numpy.typing import NDArray
@@ -23,7 +27,6 @@ from scipy.signal import resample
 # Local model imports
 import torch
 #import whisper
-from transformers import AutoProcessor, AutoModelForCausalLM
 from PIL import Image
 
 
@@ -59,6 +62,10 @@ class LocalConversationHandler(AsyncStreamHandler):
         self.gemma_model: Optional[Any] = None
         self.gemma_model_name = "google/gemma-3-4b-it"
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.use_ollama = True
+        self.ollama_model = "gemma3:4b"
+        self.ollama_base_url = "http://localhost:11434"
         
         # Intent classifier
         from reachy_mini_conversation_app.intent_classifier import IntentClassifier
@@ -88,47 +95,44 @@ class LocalConversationHandler(AsyncStreamHandler):
         self._shutdown_requested = False
         self._processing_task: Optional[asyncio.Task] = None
 
+        self._cached_emotion_list: Optional[str] = None
+
     def copy(self) -> "LocalConversationHandler":
         """Create a copy of the handler."""
         return LocalConversationHandler(self.deps, self.gradio_mode, self.instance_path)
 
     async def _load_models(self) -> None:
-        """Load Whisper, Gemma 3 VLM, and initialize TTS."""
+        """Load Whisper and Gemma (either Ollama or transformers)."""
         try:
             # Load Faster-Whisper model
             logger.info("Loading Faster-Whisper model...")
             from faster_whisper import WhisperModel
             self.whisper_model = await asyncio.to_thread(
                 WhisperModel,
-                "base",  # or "small", "medium" - base is fastest
+                "small",
                 device="cuda",
                 compute_type="float16"
             )
             logger.info("Faster-Whisper model loaded")
 
-            # Load Gemma 3 VLM
-            logger.info(f"Loading Gemma 3 VLM: {self.gemma_model_name} on {self.device}")
-            
-            def load_gemma():
-                from huggingface_hub import login
-                import os
-
-                hf_token = os.getenv("HF_TOKEN")
-                if hf_token:
-                    login(token=hf_token)
-
-                processor = AutoProcessor.from_pretrained(self.gemma_model_name)
-                model = AutoModelForCausalLM.from_pretrained(
-                    self.gemma_model_name,
-                    torch_dtype=torch.bfloat16 if self.device == "cuda" else torch.float32,
-                    device_map="auto" if self.device == "cuda" else None,
-                )
-                if self.device == "cpu":
-                    model = model.to("cpu")
-                return processor, model
-            
-            self.gemma_processor, self.gemma_model = await asyncio.to_thread(load_gemma)
-            logger.info(f"Gemma 3 VLM loaded on {self.device}")
+            # Check if using Ollama or transformers
+            if self.use_ollama:
+                logger.info(f"Using Ollama for LLM: {self.ollama_model}")
+                # Verify Ollama is running
+                try:
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(f"{self.ollama_base_url}/api/tags")
+                        models = response.json().get("models", [])
+                        model_names = [m["name"] for m in models]
+                        
+                        if self.ollama_model in model_names:
+                            logger.info(f"✓ Ollama model {self.ollama_model} available")
+                        else:
+                            logger.warning(f"⚠️ Model {self.ollama_model} not found in Ollama")
+                            logger.info(f"Available models: {model_names}")
+                except Exception as e:
+                    logger.error(f"❌ Ollama not accessible: {e}")
+                    raise  # Don't fallback, just fail
 
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
@@ -255,19 +259,7 @@ class LocalConversationHandler(AsyncStreamHandler):
             logger.info("Generating response with Gemma 3 VLM...")
             response_text, tool_calls = await self._get_llm_response(transcript, image, intent, entities)
 
-            # Step 4: Execute tool calls if any
-            if tool_calls:
-                await self._execute_tool_calls(tool_calls)
-
-                # Get follow-up response after tool execution
-                response_text, _ = await self._get_llm_response(
-                    "Based on the tool results, respond to the user.",
-                    None,
-                    intent,
-                    entities
-                )
-
-            # Step 5: Emit assistant response
+            # Step 4: Emit assistant response FIRST (before executing tools)
             if response_text:
                 response_text = self._clean_response_text(response_text)
 
@@ -276,8 +268,13 @@ class LocalConversationHandler(AsyncStreamHandler):
                     AdditionalOutputs({"role": "assistant", "content": response_text})
                 )
 
-                # Step 6: Generate speech (TTS)
+                # Generate speech (TTS) - say it before doing the action
                 await self._generate_speech(response_text)
+
+            # Step 5: Execute tool calls AFTER speaking
+            if tool_calls:
+                await self._execute_tool_calls(tool_calls)
+                # No follow-up response needed since we already spoke
 
             self.deps.movement_manager.set_listening(False)
 
@@ -311,9 +308,10 @@ class LocalConversationHandler(AsyncStreamHandler):
             segments, info = self.whisper_model.transcribe(
                 audio_float,
                 language="en",
-                beam_size=1,
+                beam_size=3,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
+                vad_parameters=dict(min_silence_duration_ms=400),
+                initial_prompt="Hey Reachy"
             )
             return " ".join([segment.text for segment in segments]).strip()
         
@@ -327,15 +325,28 @@ class LocalConversationHandler(AsyncStreamHandler):
         
         # WAKE WORD CHECK - Only process if "reachy" is mentioned
         transcript_lower = transcript.lower()
-        wake_words = ["reachy", "richie", "reach", "reiki", "ricky"]
+        wake_words = ["reachy", "richie", "reach", "reiki", "ricky", "reichy"]
         has_wake_word = any(word in transcript_lower for word in wake_words)
-        
+
         if not has_wake_word:
             logger.info(f"⏭️  No wake word: '{transcript}' - IGNORED")
             return ""
         
         logger.info(f"✅ Wake word detected: '{transcript}'")
         return transcript
+    
+    def _clear_bad_history(self):
+        """Clear conversation history if it contains narrative responses."""
+        cleaned = []
+        for msg in self.conversation_history:
+            content = msg.get("content", "")
+            # Keep only good responses (no narrative descriptions)
+            if not ("(" in content and ")" in content and "He" in content):
+                cleaned.append(msg)
+        
+        if len(cleaned) < len(self.conversation_history):
+            logger.info(f"🧹 Cleared {len(self.conversation_history) - len(cleaned)} bad responses from history")
+            self.conversation_history = cleaned
 
     async def _get_llm_response(
         self, 
@@ -344,138 +355,22 @@ class LocalConversationHandler(AsyncStreamHandler):
         intent: Optional[str] = None,
         entities: Optional[dict] = None
     ) -> Tuple[str, list]:
-        """Get response from Gemma 3 VLM with optional image input."""
-        from reachy_mini_conversation_app.prompts import get_session_instructions
-        from reachy_mini_conversation_app.tools.core_tools import get_tool_specs
+        """Get response from Gemma with optional image input."""
         
-        # Build system prompt with tool definitions
-        system_prompt = get_session_instructions()
+        # Clear bad history first
+        self._clear_bad_history()
         
-        tool_specs = get_tool_specs()
-        if tool_specs:
-            tools_description = "\n\nAVAILABLE TOOLS:\n"
-            for tool in tool_specs:
-                name = tool.get("name", "")
-                desc = tool.get("description", "")
-                params = tool.get("parameters", {}).get("properties", {})
-                
-                tools_description += f"\n{name}:\n"
-                tools_description += f"  Description: {desc}\n"
-                tools_description += f"  Parameters: {list(params.keys())}\n"
-            
-            tools_description += """
-TO USE A TOOL, include in your response:
-[TOOL:tool_name:{"param1":"value1","param2":"value2"}]
-
-Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
-"""
-            system_prompt += tools_description
+        # Build system prompt dynamically based on available tools
+        system_prompt = self._build_system_prompt()
         
-        # Build messages
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        # Add conversation history (keep last 20)
-        for msg in self.conversation_history[-20:]:
-            messages.append(msg)
-        
-        # Add current user message with optional image
-        if image is not None:
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": user_message}
-                ]
-            })
-        else:
-            messages.append({"role": "user", "content": user_message})
-
         try:
-            def generate_response():
-                # FIXED: Properly handle text-only vs text+image messages
-                if image is not None:
-                    # For image inputs, use the processor directly
-                    text_content = []
-                    for msg in messages:
-                        if msg["role"] == "system":
-                            text_content.append(msg["content"])
-                        elif msg["role"] == "user":
-                            if isinstance(msg["content"], str):
-                                text_content.append(msg["content"])
-                            elif isinstance(msg["content"], list):
-                                for item in msg["content"]:
-                                    if item.get("type") == "text":
-                                        text_content.append(item["text"])
-                        elif msg["role"] == "assistant":
-                            text_content.append(msg["content"])
-                    
-                    prompt_text = "\n".join(text_content)
-                    
-                    inputs = self.gemma_processor(
-                        text=prompt_text,
-                        images=image,
-                        return_tensors="pt",
-                        padding=True
-                    )
-                else:
-                    # For text-only, use chat template
-                    # But extract text content properly
-                    text_messages = []
-                    for msg in messages:
-                        if isinstance(msg.get("content"), str):
-                            text_messages.append(msg)
-                        elif isinstance(msg.get("content"), list):
-                            # Extract text from list content
-                            text_parts = [item["text"] for item in msg["content"] if item.get("type") == "text"]
-                            if text_parts:
-                                text_messages.append({
-                                    "role": msg["role"],
-                                    "content": " ".join(text_parts)
-                                })
-                    
-                    # Apply chat template to text-only messages
-                    prompt_text = self.gemma_processor.tokenizer.apply_chat_template(
-                        text_messages,
-                        tokenize=False,
-                        add_generation_prompt=True
-                    )
-                    
-                    inputs = self.gemma_processor(
-                        text=prompt_text,
-                        return_tensors="pt",
-                        padding=True
-                    )
-                
-                # Move inputs to device
-                inputs = {k: v.to(self.device) if hasattr(v, 'to') else v 
-                         for k, v in inputs.items()}
-                
-                # Generate
-                with torch.no_grad():
-                    torch_version = tuple(int(x) for x in torch.__version__.split('+')[0].split('.'))
-                    
-                    gen_kwargs = {
-                        **inputs,
-                        "max_new_tokens": 200,
-                        "temperature": 0.7,
-                        "do_sample": True,
-                        "pad_token_id": self.gemma_processor.tokenizer.eos_token_id,
-                    }
-                    
-                    # Only add attention_mask if PyTorch >= 2.6
-                    if torch_version >= (2, 6, 0):
-                        # These features require PyTorch 2.6+
-                        pass
-                    
-                    outputs = self.gemma_model.generate(**gen_kwargs)
-                 
-                
-                response = self.gemma_processor.decode(outputs[0], skip_special_tokens=True)
-                return response
+            # Get response from Ollama
+            response_text, tool_calls = await self._get_ollama_response(
+                user_message, image, system_prompt
+            )
             
-            full_response = await asyncio.to_thread(generate_response)
-            response_text = self._extract_assistant_response(full_response, messages)
-            tool_calls = self._extract_tool_calls(response_text)
+            # ENFORCE rules in post-processing
+            response_text = self._enforce_response_rules(response_text)
             
             # Update conversation history
             self.conversation_history.append({"role": "user", "content": user_message})
@@ -484,31 +379,175 @@ Example: "I'll dance for you! [TOOL:dance:{"move":"random","repeat":1}]"
             return response_text, tool_calls
 
         except Exception as e:
-            logger.error(f"Gemma 3 error: {e}")
+            logger.error(f"LLM error: {e}")
             return "I'm having trouble thinking right now.", []
-    
-    def _extract_assistant_response(self, full_text: str, messages: list) -> str:
-        """Extract only the new assistant response."""
-        last_user_msg = messages[-1]["content"]
-        if isinstance(last_user_msg, list):
-            last_user_msg = next((item["text"] for item in last_user_msg if item["type"] == "text"), "")
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt dynamically based on available tools."""
+        from reachy_mini_conversation_app.tools.core_tools import ALL_TOOLS
         
-        markers = ["assistant\n", "Assistant:", "<assistant>", "\n\n"]
+        # Get available emotions (cached)
+        emotion_list = "cheerful1, enthusiastic1, curious1, attentive1, grateful1"
         
-        for marker in markers:
-            if marker in full_text:
-                parts = full_text.split(marker)
-                response = parts[-1].strip()
-                if response and len(response) > 5:
-                    return response
+        if self._cached_emotion_list is None:  # Only load once
+            try:
+                from reachy_mini.motion.recorded_move import RecordedMoves
+                recorded_moves = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                emotions = recorded_moves.list_moves()
+                # Pick a few good ones for examples
+                good_emotions = [e for e in emotions if any(x in e for x in ['cheerful', 'enthusiastic', 'curious', 'grateful', 'attentive'])]
+                if good_emotions:
+                    emotion_list = ", ".join(good_emotions[:5])
+                self._cached_emotion_list = emotion_list  # Cache it
+            except Exception as e:
+                logger.warning(f"Could not load emotions dynamically: {e}")
+                self._cached_emotion_list = emotion_list  # Use default
+        else:
+            emotion_list = self._cached_emotion_list  # Use cached version
         
-        if last_user_msg in full_text:
-            idx = full_text.rindex(last_user_msg)
-            response = full_text[idx + len(last_user_msg):].strip()
-            if response:
-                return response
+        # Check which tools are available
+        has_dance = "dance" in ALL_TOOLS
+        has_move_head = "move_head" in ALL_TOOLS
+        has_play_emotion = "play_emotion" in ALL_TOOLS
         
-        return full_text.strip()
+        # Build tools section
+        tools_section = "AVAILABLE TOOLS:\n"
+        
+        if has_move_head:
+            tools_section += "- move_head: [TOOL:move_head:{\"direction\":\"left\"}]\n"
+            tools_section += "  Directions: left, right, up, down, front\n"
+        
+        if has_play_emotion:
+            tools_section += f"- play_emotion: [TOOL:play_emotion:{{\"emotion\":\"{emotion_list.split(',')[0].strip()}\"}}]\n"
+            tools_section += f"  Available emotions: {emotion_list}\n"
+        
+        if has_dance:
+            tools_section += "- dance: [TOOL:dance:{\"move\":\"random\",\"repeat\":1}]\n"
+        
+        # Build examples based on available tools
+        examples = []
+        
+        if has_play_emotion:
+            first_emotion = emotion_list.split(',')[0].strip()
+            examples.append(f'User: "Hello!"\nReachy: "Hi! I\'m Reachy! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
+            examples.append(f'User: "How are you?"\nReachy: "I\'m doing great! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
+        
+        if has_dance:
+            examples.append('User: "Dance for me"\nReachy: "I\'d love to dance! [TOOL:dance:{\\"move\\":\\"random\\",\\"repeat\\":1}]"')
+        
+        if has_move_head:
+            examples.append('User: "Look left"\nReachy: "Looking left now. [TOOL:move_head:{\\"direction\\":\\"left\\"}]"')
+        
+        examples.append('User: "Tell me a joke"\nReachy: "Why did the robot cross the playground? To get to the other slide!"')
+        
+        examples_text = "\n\n".join(examples)
+        
+        return f"""You are Reachy, a friendly robot assistant. Follow these rules STRICTLY:
+
+    1. Your name is Reachy (NOT Gemma)
+    2. Keep responses SHORT (1-2 sentences max)
+    3. NO EMOJIS - you're a robot, not a cartoon
+    4. When asked to do physical actions, you MUST use the tool format
+    5. Don't describe actions - just use the tool
+    6. When you see an image, describe what you see concisely
+
+    TOOL FORMAT (use EXACTLY this format):
+    [TOOL:tool_name:{{"param":"value"}}]
+
+    {tools_section}
+
+    CORRECT EXAMPLES:
+    {examples_text}
+
+    WRONG (don't do this):
+    - Using emojis
+    - Describing actions instead of using tools
+    - Saying you're "Gemma"
+    - Long explanations
+    - Using tools or emotions that don't exist"""
+        
+        
+    async def _get_ollama_response(
+        self,
+        user_message: str,
+        image: Optional[Image.Image],
+        system_prompt: str
+    ) -> Tuple[str, list]:
+        """Get response from Ollama."""
+        
+        # Build messages - MATCH TEST FILE EXACTLY
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add conversation history (last 3 pairs max)
+        #history_to_use = self.conversation_history[-6:]
+        #for msg in history_to_use:
+        #    messages.append(msg)
+        
+        # Add current user message
+        if image is not None:
+            # Convert image to base64
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            
+            messages.append({
+                "role": "user",
+                "content": user_message,
+                "images": [img_str]
+            })
+        else:
+            messages.append({
+                "role": "user",
+                "content": user_message
+            })
+        
+        # Call Ollama API - EXACT SAME AS TEST FILE
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                response = await client.post(
+                    f"{self.ollama_base_url}/api/chat",
+                    json={
+                        "model": self.ollama_model,
+                        "messages": messages,
+                        "system": system_prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.7,  # ← MATCH TEST FILE
+                            "num_predict": 75,   # ← MATCH TEST FILE
+                            "top_k": 50,         # ← MATCH TEST FILE
+                            "top_p": 0.9,        # ← MATCH TEST FILE
+                        }
+                    }
+                )
+
+                result = response.json()
+                response_text = result["message"]["content"].strip()
+                
+                # Extract tool calls
+                tool_calls = self._extract_tool_calls(response_text)
+                
+                return response_text, tool_calls
+                
+            except Exception as e:
+                return f"Error: {e}", []
+        
+    def _enforce_response_rules(self, text: str) -> str:
+        """Enforce strict response rules."""
+        # Remove emojis
+        import re
+        text = re.sub(r'[😀-🙏🌀-🗿🚀-🛿☀-➿]', '', text)
+        
+        # Remove markdown
+        text = text.replace('*', '').replace('-', '').replace('#', '')
+        
+        # If too long, truncate
+        words = text.split()
+        if len(words) > 15:
+            text = ' '.join(words[:15]) + '...'
+            logger.warning(f"⚠️ Truncated long response to 15 words")
+        
+        return text.strip()
+        
     
     def _extract_tool_calls(self, text: str) -> list:
         """Extract tool calls from response text."""
