@@ -374,7 +374,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         """Get response from Gemma with optional image input."""
         
         # Clear bad history first
-        self._clear_bad_history()
+        # self._clear_bad_history()
         
         # Build system prompt dynamically based on available tools
         system_prompt = self._build_system_prompt()
@@ -392,11 +392,23 @@ class LocalConversationHandler(AsyncStreamHandler):
             self.conversation_history.append({"role": "user", "content": user_message})
             self.conversation_history.append({"role": "assistant", "content": response_text})
 
+            # Manage history size
+            self._manage_conversation_history()
+
             return response_text, tool_calls
 
         except Exception as e:
             logger.error(f"LLM error: {e}")
             return "I'm having trouble thinking right now.", []
+        
+    def _manage_conversation_history(self):
+        """Keep conversation history at a reasonable size."""
+        MAX_MESSAGES = 20  # Keep last 20 messages (10 user/assistant pairs)
+        
+        if len(self.conversation_history) > MAX_MESSAGES:
+            # Keep only the most recent messages
+            self.conversation_history = self.conversation_history[-MAX_MESSAGES:]
+            logger.debug(f"Trimmed conversation history to {MAX_MESSAGES} messages")
 
     def _build_system_prompt(self) -> str:
         """Build system prompt dynamically based on available tools."""
@@ -551,9 +563,9 @@ class LocalConversationHandler(AsyncStreamHandler):
         messages = [{"role": "system", "content": system_prompt}]
         
         # Add conversation history (last 3 pairs max)
-        #history_to_use = self.conversation_history[-6:]
-        #for msg in history_to_use:
-        #    messages.append(msg)
+        history_to_use = self.conversation_history[-10:]
+        for msg in history_to_use:
+            messages.append(msg)
         
         # Add current user message
         if image is not None:
