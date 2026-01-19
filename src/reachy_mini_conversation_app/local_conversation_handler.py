@@ -1,4 +1,4 @@
-"""Local conversation handler using Whisper (STT) + Gemma 3 (VLM) + pyttsx3 (TTS).
+"""Local conversation handler using Whisper (STT) + Gemma 3 (VLM) + pyttsx3 & elevenlabs (TTS).
 
 FIXED VERSION with:
 - Working audio processing loop
@@ -29,6 +29,8 @@ import torch
 #import whisper
 from PIL import Image
 
+import os
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,18 @@ class LocalConversationHandler(AsyncStreamHandler):
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
 
+        self.tts_provider = os.getenv("TTS_PROVIDER", "pyttsx3")  # "pyttsx3" or "elevenlabs"
+        self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+        self.elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
+        self.elevenlabs_model = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+        
+        # Validate ElevenLabs setup if selected
+        if self.tts_provider == "elevenlabs" and not self.elevenlabs_api_key:
+            logger.warning("⚠️ ElevenLabs selected but no API key found. Falling back to pyttsx3")
+            self.tts_provider = "pyttsx3"
+        
+        logger.info(f"TTS Provider: {self.tts_provider}")
+
         # Queues for audio processing
         self.input_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]]]" = asyncio.Queue()
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
@@ -73,7 +87,9 @@ class LocalConversationHandler(AsyncStreamHandler):
         
         # Task manager
         from reachy_mini_conversation_app.task_manager import TaskManager
-        self.task_manager = TaskManager()
+        self.task_manager = TaskManager(tts_callback=self._speak_notification)
+
+        self.deps.task_manager = self.task_manager
         
         # Conversation state
         self.conversation_history: list = []
@@ -409,6 +425,11 @@ class LocalConversationHandler(AsyncStreamHandler):
         has_dance = "dance" in ALL_TOOLS
         has_move_head = "move_head" in ALL_TOOLS
         has_play_emotion = "play_emotion" in ALL_TOOLS
+        has_camera = "camera" in ALL_TOOLS
+        has_create_timer = "create_timer" in ALL_TOOLS
+        has_create_reminder = "create_reminder" in ALL_TOOLS
+        has_list_tasks = "list_tasks" in ALL_TOOLS
+        has_head_tracking = "head_tracking" in ALL_TOOLS
         
         # Build tools section
         tools_section = "AVAILABLE TOOLS:\n"
@@ -418,26 +439,64 @@ class LocalConversationHandler(AsyncStreamHandler):
             tools_section += "  Directions: left, right, up, down, front\n"
         
         if has_play_emotion:
-            tools_section += f"- play_emotion: [TOOL:play_emotion:{{\"emotion\":\"{emotion_list.split(',')[0].strip()}\"}}]\n"
+            first_emotion = emotion_list.split(',')[0].strip()
+            tools_section += f"- play_emotion: [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]\n"
             tools_section += f"  Available emotions: {emotion_list}\n"
         
         if has_dance:
             tools_section += "- dance: [TOOL:dance:{\"move\":\"random\",\"repeat\":1}]\n"
         
+        if has_camera:
+            tools_section += "- camera: [TOOL:camera:{\"question\":\"what do you see?\"}]\n"
+            tools_section += "  Use to see through the camera\n"
+        
+        if has_head_tracking:
+            tools_section += "- head_tracking: [TOOL:head_tracking:{\"start\":true}]\n"
+            tools_section += "  Enable/disable following faces with head\n"
+        
+        if has_create_timer:
+            # CHANGED: Use "duration" and "unit" instead of "duration_seconds"
+            tools_section += "- create_timer: [TOOL:create_timer:{\"duration\":10,\"unit\":\"seconds\"}]\n"
+            tools_section += "  Create countdown timers. Units: seconds, minutes, hours\n"
+        
+        if has_create_reminder:
+            # CHANGED: Use "delay" and "unit" instead of "delay_seconds"
+            tools_section += "- create_reminder: [TOOL:create_reminder:{\"message\":\"task\",\"delay\":5,\"unit\":\"minutes\"}]\n"
+            tools_section += "  Set reminders with custom messages. Units: seconds, minutes, hours\n"
+        
+        if has_list_tasks:
+            tools_section += "- list_tasks: [TOOL:list_tasks:{}]\n"
+            tools_section += "  Show active timers and reminders\n"
+        
         # Build examples based on available tools
         examples = []
         
+        # Basic interaction examples
         if has_play_emotion:
             first_emotion = emotion_list.split(',')[0].strip()
             examples.append(f'User: "Hello!"\nReachy: "Hi! I\'m Reachy! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
-            examples.append(f'User: "How are you?"\nReachy: "I\'m doing great! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
+        
+        # Movement examples
+        if has_move_head:
+            examples.append('User: "Look left"\nReachy: "Looking left now. [TOOL:move_head:{\\"direction\\":\\"left\\"}]"')
         
         if has_dance:
             examples.append('User: "Dance for me"\nReachy: "I\'d love to dance! [TOOL:dance:{\\"move\\":\\"random\\",\\"repeat\\":1}]"')
         
-        if has_move_head:
-            examples.append('User: "Look left"\nReachy: "Looking left now. [TOOL:move_head:{\\"direction\\":\\"left\\"}]"')
+        # Timer/Reminder examples - CHANGED
+        if has_create_timer:
+            examples.append('User: "Set a timer for 10 seconds"\nReachy: "Timer set! [TOOL:create_timer:{\\"duration\\":10,\\"unit\\":\\"seconds\\"}]"')
+            examples.append('User: "Set a timer for 5 minutes"\nReachy: "Timer set for 5 minutes! [TOOL:create_timer:{\\"duration\\":5,\\"unit\\":\\"minutes\\"}]"')
         
+        if has_create_reminder:
+            examples.append('User: "Remind me to stretch in 10 minutes"\nReachy: "I\'ll remind you to stretch! [TOOL:create_reminder:{\\"message\\":\\"stretch\\",\\"delay\\":10,\\"unit\\":\\"minutes\\"}]"')
+            examples.append('User: "Remind me about the meeting in 1 hour"\nReachy: "Got it! [TOOL:create_reminder:{\\"message\\":\\"meeting\\",\\"delay\\":1,\\"unit\\":\\"hours\\"}]"')
+        
+        # Camera example
+        if has_camera:
+            examples.append('User: "What do you see?"\nReachy: "Let me look. [TOOL:camera:{\\"question\\":\\"what do you see?\\"}]"')
+        
+        # General conversation example
         examples.append('User: "Tell me a joke"\nReachy: "Why did the robot cross the playground? To get to the other slide!"')
         
         examples_text = "\n\n".join(examples)
@@ -448,13 +507,23 @@ class LocalConversationHandler(AsyncStreamHandler):
     2. Keep responses SHORT (1-2 sentences max)
     3. NO EMOJIS - you're a robot, not a cartoon
     4. When asked to do physical actions, you MUST use the tool format
-    5. Don't describe actions - just use the tool
-    6. When you see an image, describe what you see concisely
+    5. When setting timers/reminders, ALWAYS use tools (never just acknowledge verbally)
+    6. Don't describe actions - just use the tool
+    7. When you see an image, describe what you see concisely
 
     TOOL FORMAT (use EXACTLY this format):
     [TOOL:tool_name:{{"param":"value"}}]
 
     {tools_section}
+
+    TIMER/REMINDER FORMAT:
+    - For timers: {{"duration":NUMBER,"unit":"seconds|minutes|hours"}}
+    - For reminders: {{"message":"text","delay":NUMBER,"unit":"seconds|minutes|hours"}}
+
+    Examples:
+    - 10 seconds: {{"duration":10,"unit":"seconds"}}
+    - 5 minutes: {{"duration":5,"unit":"minutes"}}
+    - 2 hours: {{"duration":2,"unit":"hours"}}
 
     CORRECT EXAMPLES:
     {examples_text}
@@ -464,7 +533,10 @@ class LocalConversationHandler(AsyncStreamHandler):
     - Describing actions instead of using tools
     - Saying you're "Gemma"
     - Long explanations
-    - Using tools or emotions that don't exist"""
+    - Using tools or emotions that don't exist
+    - Forgetting to use tools for timers/reminders
+    - Using "duration_seconds" instead of "duration" and "unit"
+    - Wrong units (always specify: "seconds", "minutes", or "hours")"""
         
         
     async def _get_ollama_response(
@@ -586,14 +658,35 @@ class LocalConversationHandler(AsyncStreamHandler):
                 # Handle task management tools
                 if tool_name == "create_reminder":
                     message = tool_args.get("message", "Reminder")
-                    delay = float(tool_args.get("delay_seconds", 60))
-                    task_id = self.task_manager.create_reminder(message, delay)
-                    result = {"task_id": task_id, "message": f"Reminder set for {delay}s"}
+                    
+                    # Convert to seconds based on unit
+                    delay_value = float(tool_args.get("delay", 60))
+                    delay_unit = tool_args.get("unit", "seconds").lower()
+                    
+                    if "minute" in delay_unit:
+                        delay_seconds = delay_value * 60
+                    elif "hour" in delay_unit:
+                        delay_seconds = delay_value * 3600
+                    else:  # seconds or default
+                        delay_seconds = delay_value
+                    
+                    task_id = self.task_manager.create_reminder(message, int(delay_seconds))
+                    result = {"task_id": task_id, "message": f"Reminder set for {delay_seconds}s"}
                 
                 elif tool_name == "create_timer":
-                    duration = float(tool_args.get("duration_seconds", 60))
-                    task_id = self.task_manager.create_timer(duration)
-                    result = {"task_id": task_id, "message": f"Timer set for {duration}s"}
+                    # Convert to seconds based on unit
+                    duration_value = float(tool_args.get("duration", 60))
+                    duration_unit = tool_args.get("unit", "seconds").lower()
+                    
+                    if "minute" in duration_unit:
+                        duration_seconds = duration_value * 60
+                    elif "hour" in duration_unit:
+                        duration_seconds = duration_value * 3600
+                    else:  # seconds or default
+                        duration_seconds = duration_value
+                    
+                    task_id = self.task_manager.create_timer(int(duration_seconds))
+                    result = {"task_id": task_id, "message": f"Timer set for {duration_seconds}s"}
                 
                 else:
                     # Standard tool dispatch
@@ -618,6 +711,37 @@ class LocalConversationHandler(AsyncStreamHandler):
                 logger.error(f"Tool execution error ({tool_name}): {e}")
 
     async def _generate_speech(self, text: str) -> None:
+        """Generate speech using configured TTS provider."""
+        if self.tts_provider == "elevenlabs":
+            await self._generate_speech_elevenlabs(text)
+        else:
+            await self._generate_speech_pyttsx3(text)
+
+    async def _speak_notification(self, message: str) -> None:
+        """Speak a notification when timer/reminder triggers.
+        
+        This is called by TaskManager when a timer expires or reminder triggers.
+        """
+        logger.info(f"🔔 Notification: {message}")
+        
+        # Generate speech for the notification
+        await self._generate_speech(message)
+        
+        # Optionally: Play an emotion to get attention
+        try:
+            from reachy_mini_conversation_app.tools.core_tools import dispatch_tool_call
+            import json
+            
+            # Play an attention-grabbing emotion
+            await dispatch_tool_call(
+                "play_emotion", 
+                json.dumps({"emotion": "curious1"}),  # or "attentive1"
+                self.deps
+            )
+        except Exception as e:
+            logger.debug(f"Could not play emotion for notification: {e}")
+        
+    async def _generate_speech_pyttsx3(self, text: str) -> None:
         """Generate speech using pyttsx3 TTS."""
         import pyttsx3
         import tempfile
@@ -643,7 +767,7 @@ class LocalConversationHandler(AsyncStreamHandler):
             return audio_data
         
         try:
-            logger.info(f"[TTS] Speaking: {text}")
+            logger.info(f"[TTS/pyttsx3] Speaking: {text}")
             audio_data = await asyncio.to_thread(generate_audio)
             
             # Send to output queue in chunks
@@ -654,7 +778,87 @@ class LocalConversationHandler(AsyncStreamHandler):
                 await asyncio.sleep(0.01)
                 
         except Exception as e:
-            logger.error(f"TTS error: {e}")
+            logger.error(f"pyttsx3 TTS error: {e}")
+
+    async def _generate_speech_elevenlabs(self, text: str) -> None:
+        """Generate speech using ElevenLabs TTS."""
+        try:
+            from elevenlabs import VoiceSettings
+            from elevenlabs.client import ElevenLabs
+            import io
+            import wave
+            
+            logger.info(f"[TTS/ElevenLabs] Speaking: {text}")
+            
+            def generate_audio():
+                client = ElevenLabs(api_key=self.elevenlabs_api_key)
+                
+                # Generate audio
+                audio_generator = client.text_to_speech.convert(
+                    voice_id=self.elevenlabs_voice_id,
+                    output_format="mp3_44100_128",
+                    text=text,
+                    model_id=self.elevenlabs_model,
+                    voice_settings=VoiceSettings(
+                        stability=0.5,
+                        similarity_boost=0.75,
+                        style=0.0,
+                        use_speaker_boost=True,
+                    ),
+                )
+                
+                # Collect audio bytes
+                audio_bytes = b"".join(audio_generator)
+                return audio_bytes
+            
+            # Generate audio in thread pool
+            audio_bytes = await asyncio.to_thread(generate_audio)
+            
+            # Convert MP3 to PCM audio data
+            audio_data = await self._convert_mp3_to_pcm(audio_bytes)
+            
+            # Send to output queue in chunks
+            chunk_size = 4800
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i + chunk_size]
+                await self.output_queue.put((OUTPUT_SAMPLE_RATE, chunk.reshape(1, -1)))
+                await asyncio.sleep(0.01)
+                
+        except Exception as e:
+            logger.error(f"ElevenLabs TTS error: {e}")
+            logger.warning("Falling back to pyttsx3")
+            await self._generate_speech_pyttsx3(text)
+
+    async def _convert_mp3_to_pcm(self, mp3_bytes: bytes) -> np.ndarray:
+        """Convert MP3 bytes to PCM audio data."""
+        try:
+            from pydub import AudioSegment
+            import io
+            
+            def convert():
+                # Load MP3 from bytes
+                audio = AudioSegment.from_mp3(io.BytesIO(mp3_bytes))
+                
+                # Convert to mono if stereo
+                if audio.channels > 1:
+                    audio = audio.set_channels(1)
+                
+                # Resample to OUTPUT_SAMPLE_RATE
+                audio = audio.set_frame_rate(OUTPUT_SAMPLE_RATE)
+                
+                # Convert to int16 numpy array
+                samples = np.array(audio.get_array_of_samples(), dtype=np.int16)
+                return samples
+            
+            return await asyncio.to_thread(convert)
+            
+        except ImportError:
+            logger.error("pydub not installed. Install with: pip install pydub")
+            logger.error("Also requires ffmpeg. Install with: pip install ffmpeg-python")
+            raise
+        except Exception as e:
+            logger.error(f"MP3 conversion error: {e}")
+            raise
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive audio frame and trigger processing when speech detected."""

@@ -20,6 +20,7 @@ class Task:
     task_type: str  # "reminder" or "timer"
     message: str
     scheduled_time: datetime
+    created_time: datetime
     callback: Optional[Callable] = None
     is_completed: bool = False
 
@@ -97,7 +98,13 @@ class TaskManager:
         if not task or task.is_completed:
             return
         
+        completion_time = datetime.now()
+        actual_elapsed = (completion_time - task.created_time).total_seconds()
+        expected_elapsed = (task.scheduled_time - task.created_time).total_seconds()
+        accuracy_diff = actual_elapsed - expected_elapsed
+
         logger.info(f"Completing task: {task_id} - {task.message}")
+        logger.info(f"⏱️  Timer accuracy: expected={expected_elapsed:.2f}s, actual={actual_elapsed:.2f}s, diff={accuracy_diff:+.2f}s")
         task.is_completed = True
         
         # Speak the notification
@@ -141,6 +148,7 @@ class TaskManager:
         self._task_counter += 1
         task_id = f"reminder_{self._task_counter}"
         
+        created_time = datetime.now()
         scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
         
         task = Task(
@@ -148,6 +156,7 @@ class TaskManager:
             task_type="reminder",
             message=message,
             scheduled_time=scheduled_time,
+            created_time=created_time,
             callback=callback
         )
         
@@ -181,6 +190,7 @@ class TaskManager:
         self._task_counter += 1
         task_id = f"timer_{self._task_counter}"
         
+        created_time = datetime.now()
         scheduled_time = datetime.now() + timedelta(seconds=duration_seconds)
         
         # Format duration nicely
@@ -202,6 +212,7 @@ class TaskManager:
             task_type="timer",
             message=duration_str,
             scheduled_time=scheduled_time,
+            created_time=created_time,
             callback=callback
         )
         

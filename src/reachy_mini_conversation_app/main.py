@@ -50,6 +50,7 @@ def run(
     from reachy_mini_conversation_app.console import LocalStream
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
+    from reachy_mini_conversation_app.task_manager import TaskManager
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
@@ -129,6 +130,7 @@ def run(
         camera_worker=camera_worker,
         vision_manager=vision_manager,
         head_wobbler=head_wobbler,
+        task_manager=None,
     )
     
     current_file_path = os.path.dirname(os.path.abspath(__file__))

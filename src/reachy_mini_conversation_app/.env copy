@@ -1,0 +1,25 @@
+# Enable local models
+USE_LOCAL_MODELS=true
+
+# Whisper model (tiny, base, small, medium, large)
+WHISPER_MODEL=medium
+
+# Gemma 3 Vision-Language Model
+GEMMA_MODEL=google/gemma-3-4b-it
+
+# Your HuggingFace token (REQUIRED)
+HF_TOKEN=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
+
+# Cache directory
+HF_HOME=./cache
+
+# Optional: TTS (not yet implemented)
+TTS_ENGINE=none
+
+# TTS Configuration
+TTS_PROVIDER=elevenlabs  # Options: "pyttsx3" or "elevenlabs"
+
+# ElevenLabs Settings (only needed if using elevenlabs)
+ELEVENLABS_API_KEY=046a54680e6c6db55697046e4247bc4df791c3d7f51f7c9b62bc9e1139fecea5
+ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM  # Rachel (default)
+ELEVENLABS_MODEL=eleven_monolingual_v2
