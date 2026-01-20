@@ -313,6 +313,44 @@ class LocalConversationHandler(AsyncStreamHandler):
         cleaned = re.sub(r'\[TOOL:\w+:.*?\]', '', text)
         return cleaned.strip()
 
+    def _format_medicine_response(self, medicine_info: str) -> str:
+        """Format medicine identification result for speech."""
+        import re
+        
+        # Try to extract structured info
+        name_match = re.search(r'\*\*Medicine Name:\*\*\s*(.+?)(?:\n|$)', medicine_info)
+        dosage_match = re.search(r'\*\*Dosage.*?:\*\*\s*(.+?)(?:\n|$)', medicine_info)
+        timing_match = re.search(r'\*\*Timing.*?:\*\*\s*(.+?)(?:\n|$)', medicine_info)
+        
+        # Build spoken response
+        parts = []
+        
+        if name_match:
+            medicine_name = name_match.group(1).strip()
+            parts.append(f"This is {medicine_name}")
+        
+        if dosage_match:
+            dosage = dosage_match.group(1).strip()
+            if "None" not in dosage and dosage:
+                parts.append(f"Dosage is {dosage}")
+        
+        if timing_match:
+            timing = timing_match.group(1).strip()
+            if "None" not in timing and timing:
+                parts.append(f"Take {timing}")
+        
+        # If parsing failed, just clean up the raw text
+        if not parts:
+            # Remove markdown formatting
+            clean_text = re.sub(r'\*\*.*?\*\*', '', medicine_info)
+            clean_text = re.sub(r'\d+\.\s+', '', clean_text)  # Remove numbering
+            clean_text = clean_text.replace('\n', ' ').strip()
+            # Take first sentence
+            first_sentence = clean_text.split('.')[0] + '.'
+            return first_sentence
+        
+        return '. '.join(parts) + '.'
+
     async def _transcribe_audio(self, audio_data: NDArray[np.int16]) -> str:
         """Transcribe audio using Faster-Whisper."""
         audio_float = audio_data.astype(np.float32) / 32768.0
@@ -461,6 +499,10 @@ class LocalConversationHandler(AsyncStreamHandler):
         if has_camera:
             tools_section += "- camera: [TOOL:camera:{\"question\":\"what do you see?\"}]\n"
             tools_section += "  Use to see through the camera\n"
+
+        if "identify_medicine" in ALL_TOOLS:
+            tools_section += "- identify_medicine: [TOOL:identify_medicine:{}]\n"
+            tools_section += "  Use SPECIFICALLY to identify medicine/medication/pills\n"
         
         if has_head_tracking:
             tools_section += "- head_tracking: [TOOL:head_tracking:{\"start\":true}]\n"
@@ -507,6 +549,10 @@ class LocalConversationHandler(AsyncStreamHandler):
         # Camera example
         if has_camera:
             examples.append('User: "What do you see?"\nReachy: "Let me look. [TOOL:camera:{\\"question\\":\\"what do you see?\\"}]"')
+
+        if "identify_medicine" in ALL_TOOLS:
+            examples.append('User: "Hey Reachy, identify this medicine"\nReachy: "Let me look at that. [TOOL:identify_medicine:{}]"')
+            examples.append('User: "What medication is this?"\nReachy: "Hold it up for me. [TOOL:identify_medicine:{}]"')
         
         # General conversation example
         examples.append('User: "Tell me a joke"\nReachy: "Why did the robot cross the playground? To get to the other slide!"')
@@ -607,6 +653,10 @@ class LocalConversationHandler(AsyncStreamHandler):
                 result = response.json()
                 response_text = result["message"]["content"].strip()
                 
+                if not response_text:
+                    logger.warning("⚠️ LLM returned empty response, using fallback")
+                    response_text = "Let me check that for you."
+
                 # Extract tool calls
                 tool_calls = self._extract_tool_calls(response_text)
                 
@@ -706,6 +756,25 @@ class LocalConversationHandler(AsyncStreamHandler):
                     args_json = json.dumps(tool_args) if isinstance(tool_args, dict) else tool_args
                     result = await dispatch_tool_call(tool_name, args_json, self.deps)
                 
+                # ADD THIS: Special handling for identify_medicine
+                if tool_name == "identify_medicine" and "medicine_info" in result:
+                    medicine_info = result["medicine_info"]
+                    
+                    # Parse and format the response for speech
+                    spoken_response = self._format_medicine_response(medicine_info)
+                    
+                    # Speak the result
+                    logger.info(f"Speaking medicine info: {spoken_response}")
+                    await self._generate_speech(spoken_response)
+                    
+                    # Also output to chat
+                    await self.output_queue.put(
+                        AdditionalOutputs({
+                            "role": "assistant",
+                            "content": spoken_response
+                        })
+                    )
+                
                 await self.output_queue.put(
                     AdditionalOutputs({
                         "role": "assistant",
@@ -721,6 +790,7 @@ class LocalConversationHandler(AsyncStreamHandler):
 
             except Exception as e:
                 logger.error(f"Tool execution error ({tool_name}): {e}")
+
 
     async def _generate_speech(self, text: str) -> None:
         """Generate speech using configured TTS provider."""

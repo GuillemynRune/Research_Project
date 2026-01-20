@@ -1,6 +1,5 @@
 play_emotion
 stop_emotion
-camera
 do_nothing
 head_tracking
 move_head
@@ -8,3 +7,4 @@ create_timer
 create_reminder
 list_tasks
 cancel_task
+identify_medicine
