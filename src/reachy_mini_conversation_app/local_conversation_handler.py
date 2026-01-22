@@ -191,7 +191,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         
         # Lower threshold = more sensitive (triggers on quieter sounds)
         # Higher threshold = less sensitive (only triggers on louder sounds)
-        threshold = 0.02  # Adjust this if needed
+        threshold = 0.008  # Adjust this if needed
 
         is_silent = rms < threshold
         
@@ -202,7 +202,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         return is_silent
 
     async def _process_speech(self) -> None:
-        """Process buffered speech."""
+        """Process buffered speech with robust error handling."""
         if self.is_processing or not self.audio_buffer:
             return
         
@@ -224,23 +224,29 @@ class LocalConversationHandler(AsyncStreamHandler):
             audio_float = audio_data.astype(np.float32) / 32768.0
             rms = np.sqrt(np.mean(audio_float ** 2))
             
-            if rms < 0.05:
+            if rms < 0.01:
                 logger.info(f"🔇 Audio too quiet (RMS={rms:.4f}), skipping transcription")
                 self.is_processing = False
                 return
             
             logger.info(f"🎤 Processing audio (RMS={rms:.4f})")
 
-            # Now safe to transcribe
+            # Transcribe
             self.deps.movement_manager.set_listening(True)
             logger.info("Transcribing speech...")
-            transcript = await self._transcribe_audio(audio_data)
+            
+            try:
+                transcript = await self._transcribe_audio(audio_data)
+            except Exception as e:
+                logger.error(f"Transcription error: {e}", exc_info=True)
+                self.deps.movement_manager.set_listening(False)
+                self.is_processing = False
+                return
 
             if not transcript or len(transcript.strip()) < 3:
-                logger.debug("Transcript too short, ignoring")
+                logger.debug("Transcript too short or empty, ignoring")
                 self.deps.movement_manager.set_listening(False)
-                # After silence, return to callword mode
-                self.awaiting_callword = True
+                self.is_processing = False
                 return
 
             logger.info(f"User said: {transcript}")
@@ -248,7 +254,7 @@ class LocalConversationHandler(AsyncStreamHandler):
                 AdditionalOutputs({"role": "user", "content": transcript})
             )
 
-            # Step 1.5: Classify intent
+            # Classify intent
             intent, confidence = self.intent_classifier.classify(transcript)
             logger.info(f"Intent: {intent} (confidence: {confidence:.2f})")
 
@@ -256,7 +262,7 @@ class LocalConversationHandler(AsyncStreamHandler):
             if entities:
                 logger.info(f"Entities: {entities}")
 
-            # Step 2: Check if this needs camera/vision input
+            # Check if needs vision
             image = None
             needs_vision = intent == 'vision_query'
 
@@ -266,42 +272,73 @@ class LocalConversationHandler(AsyncStreamHandler):
                 if frame is not None:
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     image = Image.fromarray(rgb_frame)
-
                     await self.output_queue.put(
                         AdditionalOutputs({"role": "assistant", "content": image})
                     )
 
-            # Step 3: Get LLM response with optional image
+            # Get LLM response
             logger.info("Generating response with Gemma 3 VLM...")
-            response_text, tool_calls = await self._get_llm_response(transcript, image, intent, entities)
+            try:
+                response_text, tool_calls = await self._get_llm_response(
+                    transcript, image, intent, entities
+                )
+            except Exception as e:
+                logger.error(f"LLM error: {e}", exc_info=True)
+                response_text = "Sorry, I had trouble processing that."
+                tool_calls = []
 
-            # Step 4: Emit assistant response FIRST (before executing tools)
+            # Clean and validate response
             if response_text:
                 response_text = self._clean_response_text(response_text)
+                
+                # Safety check - ensure response isn't empty after cleaning
+                if not response_text or len(response_text.strip()) < 2:
+                    logger.warning("Response empty after cleaning, using fallback")
+                    response_text = "I'm not sure how to respond to that."
 
                 logger.info(f"Assistant: {response_text}")
                 await self.output_queue.put(
                     AdditionalOutputs({"role": "assistant", "content": response_text})
                 )
 
-                # Generate speech (TTS) - say it before doing the action
-                await self._generate_speech(response_text)
+                # Generate speech
+                try:
+                    await self._generate_speech(response_text)
+                except Exception as e:
+                    logger.error(f"TTS error: {e}", exc_info=True)
+                    # Continue even if TTS fails
+            else:
+                logger.warning("⚠️ LLM returned empty response, using fallback")
+                fallback = "I didn't quite catch that."
+                await self.output_queue.put(
+                    AdditionalOutputs({"role": "assistant", "content": fallback})
+                )
+                try:
+                    await self._generate_speech(fallback)
+                except Exception as e:
+                    logger.error(f"TTS error on fallback: {e}")
 
-            # Step 5: Execute tool calls AFTER speaking
+            # Execute tool calls
             if tool_calls:
-                await self._execute_tool_calls(tool_calls)
-                # No follow-up response needed since we already spoke
+                try:
+                    await self._execute_tool_calls(tool_calls)
+                except Exception as e:
+                    logger.error(f"Tool execution error: {e}", exc_info=True)
 
             self.deps.movement_manager.set_listening(False)
 
         except Exception as e:
             logger.error(f"Error processing speech: {e}", exc_info=True)
-            await self.output_queue.put(
-                AdditionalOutputs({
-                    "role": "assistant",
-                    "content": "Sorry, I had trouble processing that. Could you repeat?"
-                })
-            )
+            # Try to send error message to user
+            try:
+                await self.output_queue.put(
+                    AdditionalOutputs({
+                        "role": "assistant",
+                        "content": "Sorry, I encountered an error. Please try again."
+                    })
+                )
+            except:
+                pass
         finally:
             self.is_processing = False
             # After processing, return to callword mode
@@ -352,7 +389,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         return '. '.join(parts) + '.'
 
     async def _transcribe_audio(self, audio_data: NDArray[np.int16]) -> str:
-        """Transcribe audio using Faster-Whisper."""
+        """Transcribe audio using Faster-Whisper - OPTIMIZED."""
         audio_float = audio_data.astype(np.float32) / 32768.0
         
         # Normalize audio
@@ -362,10 +399,8 @@ class LocalConversationHandler(AsyncStreamHandler):
             segments, info = self.whisper_model.transcribe(
                 audio_float,
                 language="en",
-                beam_size=3,
+                beam_size=1,          # ← OPTIMIZED (was 3)
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400),
-                initial_prompt="Hey Reachy"
             )
             return " ".join([segment.text for segment in segments]).strip()
         
@@ -377,17 +412,41 @@ class LocalConversationHandler(AsyncStreamHandler):
             logger.info(f"⚠️ Too short ({word_count} words): '{transcript}'")
             return ""
         
-        # WAKE WORD CHECK - Only process if "reachy" is mentioned
+        # WAKE WORD CHECK
         transcript_lower = transcript.lower()
         wake_words = ["reachy", "richie", "reach", "reiki", "ricky", "reichy"]
-        has_wake_word = any(word in transcript_lower for word in wake_words)
-
-        if not has_wake_word:
+        
+        # Find where wake word appears
+        wake_word_index = -1
+        found_wake_word = None
+        for wake_word in wake_words:
+            if wake_word in transcript_lower:
+                wake_word_index = transcript_lower.find(wake_word)
+                found_wake_word = wake_word
+                break
+        
+        if wake_word_index == -1:
             logger.info(f"⏭️  No wake word: '{transcript}' - IGNORED")
             return ""
         
-        logger.info(f"✅ Wake word detected: '{transcript}'")
-        return transcript
+        # IMPORTANT: Remove everything BEFORE the wake word
+        # This filters out the "Hey hey hey jump jump" nonsense
+        words = transcript.split()
+        cleaned_words = []
+        found = False
+        
+        for word in words:
+            if not found and any(ww in word.lower() for ww in wake_words):
+                found = True
+            if found:
+                cleaned_words.append(word)
+        
+        cleaned_transcript = " ".join(cleaned_words)
+        
+        logger.info(f"✅ Wake word '{found_wake_word}' found")
+        logger.info(f"📝 Cleaned: '{cleaned_transcript}'")
+        
+        return cleaned_transcript
     
     def _clear_bad_history(self):
         """Clear conversation history if it contains narrative responses."""
@@ -409,12 +468,8 @@ class LocalConversationHandler(AsyncStreamHandler):
         intent: Optional[str] = None,
         entities: Optional[dict] = None
     ) -> Tuple[str, list]:
-        """Get response from Gemma with optional image input."""
+        """Get response from Gemma with tool call validation."""
         
-        # Clear bad history first
-        # self._clear_bad_history()
-        
-        # Build system prompt dynamically based on available tools
         system_prompt = self._build_system_prompt()
         
         try:
@@ -423,20 +478,85 @@ class LocalConversationHandler(AsyncStreamHandler):
                 user_message, image, system_prompt
             )
             
-            # ENFORCE rules in post-processing
-            response_text = self._enforce_response_rules(response_text)
+            # VALIDATE TOOL CALLS - Filter out inappropriate ones
+            validated_tool_calls = []
+            user_lower = user_message.lower()
+            
+            for tool_call in tool_calls:
+                tool_name = tool_call.get("function", {}).get("name")
+                
+                # Validation rules for each tool
+                if tool_name == "identify_medicine":
+                    # Only allow if explicitly asking about medicine
+                    medicine_keywords = ["medicine", "medication", "pill", "tablet", 
+                                    "prescription", "drug", "capsule", "identify"]
+                    has_keyword = any(kw in user_lower for kw in medicine_keywords)
+                    
+                    if has_keyword:
+                        validated_tool_calls.append(tool_call)
+                        logger.info(f"✅ Medicine identification requested")
+                    else:
+                        logger.info(f"⏭️  Skipped identify_medicine - not explicitly requested")
+                
+                elif tool_name == "list_tasks":
+                    # Only allow if asking about tasks/timers/reminders
+                    task_keywords = ["task", "timer", "reminder", "list", "show", "active"]
+                    has_keyword = any(kw in user_lower for kw in task_keywords)
+                    
+                    if has_keyword:
+                        validated_tool_calls.append(tool_call)
+                        logger.info(f"✅ List tasks requested")
+                    else:
+                        logger.info(f"⏭️  Skipped list_tasks - asking general question, not about tasks")
+                
+                elif tool_name == "create_timer":
+                    # Only allow if explicitly setting a timer
+                    timer_keywords = ["timer", "set a timer", "countdown"]
+                    has_keyword = any(kw in user_lower for kw in timer_keywords)
+                    
+                    if has_keyword:
+                        validated_tool_calls.append(tool_call)
+                    else:
+                        logger.info(f"⏭️  Skipped create_timer - not a timer request")
+                
+                elif tool_name == "create_reminder":
+                    # Only allow if explicitly setting a reminder
+                    reminder_keywords = ["remind", "reminder"]
+                    has_keyword = any(kw in user_lower for kw in reminder_keywords)
+                    
+                    if has_keyword:
+                        validated_tool_calls.append(tool_call)
+                    else:
+                        logger.info(f"⏭️  Skipped create_reminder - not a reminder request")
+                
+                else:
+                    # Allow other tools (move_head, play_emotion, etc.) without strict validation
+                    validated_tool_calls.append(tool_call)
+            
+            # Validate response text
+            if not response_text:
+                response_text = "Let me help you with that."
+            
+            # Clean response
+            response_text = self._clean_response_text(response_text)
+            
+            # Final safety check
+            if not response_text or len(response_text.strip()) < 2:
+                if validated_tool_calls:
+                    response_text = "One moment."
+                else:
+                    response_text = "I'm listening."
             
             # Update conversation history
             self.conversation_history.append({"role": "user", "content": user_message})
             self.conversation_history.append({"role": "assistant", "content": response_text})
 
-            # Manage history size
             self._manage_conversation_history()
 
-            return response_text, tool_calls
+            return response_text, validated_tool_calls
 
         except Exception as e:
-            logger.error(f"LLM error: {e}")
+            logger.error(f"LLM error: {e}", exc_info=True)
             return "I'm having trouble thinking right now.", []
         
     def _manage_conversation_history(self):
@@ -503,6 +623,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         if "identify_medicine" in ALL_TOOLS:
             tools_section += "- identify_medicine: [TOOL:identify_medicine:{}]\n"
             tools_section += "  Use SPECIFICALLY to identify medicine/medication/pills\n"
+            tools_section += "  ALWAYS say something before using this tool\n"
         
         if has_head_tracking:
             tools_section += "- head_tracking: [TOOL:head_tracking:{\"start\":true}]\n"
@@ -568,6 +689,10 @@ class LocalConversationHandler(AsyncStreamHandler):
     5. When setting timers/reminders, ALWAYS use tools (never just acknowledge verbally)
     6. Don't describe actions - just use the tool
     7. When you see an image, describe what you see concisely
+
+    CRITICAL FORMATTING RULE:
+    ALWAYS include text before tool calls!
+    CORRECT: "Let me check. [TOOL:identify_medicine:{{}}]"
 
     TOOL FORMAT (use EXACTLY this format):
     [TOOL:tool_name:{{"param":"value"}}]
@@ -793,11 +918,23 @@ class LocalConversationHandler(AsyncStreamHandler):
 
 
     async def _generate_speech(self, text: str) -> None:
-        """Generate speech using configured TTS provider."""
-        if self.tts_provider == "elevenlabs":
-            await self._generate_speech_elevenlabs(text)
-        else:
-            await self._generate_speech_pyttsx3(text)
+        """Generate speech using configured TTS provider with error handling."""
+        
+        # Safety check
+        if not text or len(text.strip()) < 2:
+            logger.warning("⚠️ TTS called with empty/invalid text, skipping")
+            return
+        
+        # Clean text for TTS
+        text = text.strip()
+        
+        try:
+            if self.tts_provider == "elevenlabs":
+                await self._generate_speech_elevenlabs(text)
+            else:
+                await self._generate_speech_pyttsx3(text)
+        except Exception as e:
+            logger.error(f"TTS generation failed: {e}", exc_info=True)
 
     async def _speak_notification(self, message: str) -> None:
         """Speak a notification when timer/reminder triggers.
@@ -824,33 +961,50 @@ class LocalConversationHandler(AsyncStreamHandler):
             logger.debug(f"Could not play emotion for notification: {e}")
         
     async def _generate_speech_pyttsx3(self, text: str) -> None:
-        """Generate speech using pyttsx3 TTS."""
+        """Generate speech using pyttsx3 TTS with robust error handling."""
         import pyttsx3
         import tempfile
         import wave
         import os
         
+        if not text or len(text.strip()) < 2:
+            logger.warning("Skipping TTS for empty text")
+            return
+        
         def generate_audio():
-            engine = pyttsx3.init()
-            engine.setProperty('rate', 150)
-            engine.setProperty('volume', 0.9)
-            
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-                temp_path = f.name
-            
-            engine.save_to_file(text, temp_path)
-            engine.runAndWait()
-            
-            with wave.open(temp_path, 'rb') as wav:
-                frames = wav.readframes(wav.getnframes())
-                audio_data = np.frombuffer(frames, dtype=np.int16)
-            
-            os.remove(temp_path)
-            return audio_data
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 150)
+                engine.setProperty('volume', 0.9)
+                
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    temp_path = f.name
+                
+                engine.save_to_file(text, temp_path)
+                engine.runAndWait()
+                
+                # Verify file was created
+                if not os.path.exists(temp_path):
+                    raise Exception("TTS file was not created")
+                
+                with wave.open(temp_path, 'rb') as wav:
+                    frames = wav.readframes(wav.getnframes())
+                    audio_data = np.frombuffer(frames, dtype=np.int16)
+                
+                os.remove(temp_path)
+                return audio_data
+                
+            except Exception as e:
+                logger.error(f"pyttsx3 generation error: {e}")
+                raise
         
         try:
-            logger.info(f"[TTS/pyttsx3] Speaking: {text}")
+            logger.info(f"[TTS/pyttsx3] Speaking: {text[:50]}...")
             audio_data = await asyncio.to_thread(generate_audio)
+            
+            if audio_data is None or len(audio_data) == 0:
+                logger.error("TTS generated empty audio")
+                return
             
             # Send to output queue in chunks
             chunk_size = 4800
@@ -858,9 +1012,9 @@ class LocalConversationHandler(AsyncStreamHandler):
                 chunk = audio_data[i:i + chunk_size]
                 await self.output_queue.put((OUTPUT_SAMPLE_RATE, chunk.reshape(1, -1)))
                 await asyncio.sleep(0.01)
-                
+                    
         except Exception as e:
-            logger.error(f"pyttsx3 TTS error: {e}")
+            logger.error(f"pyttsx3 TTS error: {e}", exc_info=True)
 
     async def _generate_speech_elevenlabs(self, text: str) -> None:
         """Generate speech using ElevenLabs TTS."""

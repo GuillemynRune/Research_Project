@@ -14,6 +14,7 @@ import sys
 import time
 import asyncio
 import logging
+import json
 from typing import List, Optional
 from pathlib import Path
 
@@ -29,16 +30,19 @@ from local_conversation_handler import LocalConversationHandler as OpenaiRealtim
 
 try:
     # FastAPI is provided by the Reachy Mini Apps runtime
-    from fastapi import FastAPI, Response
+    from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
     from pydantic import BaseModel
     from fastapi.responses import FileResponse, JSONResponse
     from starlette.staticfiles import StaticFiles
+    import cv2
 except Exception:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
     FileResponse = object  # type: ignore
     JSONResponse = object  # type: ignore
     StaticFiles = object  # type: ignore
     BaseModel = object  # type: ignore
+    WebSocket = object  # type: ignore
+    WebSocketDisconnect = object  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,7 @@ class LocalStream:
         self._instance_path: Optional[str] = instance_path
         self._settings_initialized = False
         self._asyncio_loop = None
+        self.deps = None  # Will be set from main.py
 
     # ---- Settings UI (only when API key is missing) ----
     def _read_env_lines(self, env_path: Path) -> list[str]:
@@ -301,7 +306,112 @@ class LocalStream:
                 logger.warning(f"API key validation failed: {e}")
                 return JSONResponse({"valid": False, "error": "validation_error"}, status_code=500)
 
+        # WebSocket /ws/camera -> stream camera frames in real-time
+        @self._settings_app.websocket("/ws/camera")
+        async def _camera_websocket(websocket: WebSocket):
+            """Stream camera frames via WebSocket for high FPS."""
+            await websocket.accept()
+            logger.info("WebSocket client connected")
+            
+            try:
+                # Start streaming task
+                stream_task = asyncio.create_task(self._stream_camera(websocket))
+                
+                # Listen for client messages
+                while True:
+                    try:
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                        message = json.loads(data)
+                        
+                        # Handle different message types
+                        if message.get('type') == 'get_conversation':
+                            # Send conversation history
+                            if hasattr(self.handler, 'conversation_history'):
+                                history = self.handler.conversation_history[-10:]
+                                messages = [
+                                    {"role": msg.get('role', 'unknown'), "content": str(msg.get('content', ''))}
+                                    for msg in history
+                                ]
+                                await websocket.send_json({"type": "conversation", "messages": messages})
+                    except asyncio.TimeoutError:
+                        # No message received, continue streaming
+                        pass
+                    except WebSocketDisconnect:
+                        break
+                        
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+            finally:
+                stream_task.cancel()
+                logger.info("WebSocket client disconnected")
+
+        # GET /conversation_history -> get conversation messages
+        @self._settings_app.get("/conversation_history")
+        def _conversation_history():
+            """Get recent conversation history."""
+            try:
+                if not hasattr(self.handler, 'conversation_history'):
+                    return JSONResponse({"messages": []})
+                
+                history = self.handler.conversation_history[-10:]
+                messages = []
+                for msg in history:
+                    messages.append({
+                        "role": msg.get('role', 'unknown'),
+                        "content": str(msg.get('content', ''))
+                    })
+                
+                return JSONResponse({"messages": messages})
+            except Exception as e:
+                logger.error(f"Conversation history error: {e}")
+                return JSONResponse({"messages": [], "error": str(e)})
+
+        # POST /clear_history -> clear conversation history
+        @self._settings_app.post("/clear_history")
+        def _clear_history():
+            """Clear conversation history."""
+            try:
+                if hasattr(self.handler, 'conversation_history'):
+                    self.handler.conversation_history.clear()
+                    return JSONResponse({"ok": True})
+                return JSONResponse({"ok": False, "error": "No history available"})
+            except Exception as e:
+                logger.error(f"Clear history error: {e}")
+                return JSONResponse({"ok": False, "error": str(e)})
+
         self._settings_initialized = True
+
+    async def _stream_camera(self, websocket: WebSocket):
+        """Stream camera frames to WebSocket client at 30 FPS."""
+        target_fps = 30
+        frame_delay = 1.0 / target_fps  # ~0.033 seconds
+        
+        while True:
+            try:
+                loop_start = asyncio.get_event_loop().time()
+                
+                # Get camera frame
+                if self.deps and self.deps.camera_worker:
+                    frame = self.deps.camera_worker.get_latest_frame()
+                    
+                    if frame is not None:
+                        # Encode as JPEG (lower quality for speed)
+                        success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                        
+                        if success:
+                            # Send frame as binary
+                            await websocket.send_bytes(buffer.tobytes())
+                
+                # Maintain target FPS
+                elapsed = asyncio.get_event_loop().time() - loop_start
+                sleep_time = max(0, frame_delay - elapsed)
+                await asyncio.sleep(sleep_time)
+                
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Camera stream error: {e}")
+                await asyncio.sleep(0.1)
 
     def launch(self) -> None:
         """Start the recorder/player and run the async processing loops.

@@ -160,40 +160,64 @@ def run(
     stream_manager: gr.Blocks | LocalStream | None = None
 
     if args.gradio:
-        api_key_textbox = gr.Textbox(
-            label="OPENAI API Key" if not config.USE_LOCAL_MODELS else "API Key (not used with local models)",
-            type="password",
-            value=os.getenv("OPENAI_API_KEY") if not get_space() else "",
-            visible=not config.USE_LOCAL_MODELS,  # Hide if using local models
-        )
-
-        from reachy_mini_conversation_app.gradio_personality import PersonalityUI
-
-        personality_ui = PersonalityUI()
-        personality_ui.create_components()
-
-        stream = Stream(
-            handler=handler,
-            mode="send-receive",
-            modality="audio",
-            additional_inputs=[
-                chatbot,
-                api_key_textbox,
-                *personality_ui.additional_inputs_ordered(),
-            ],
-            additional_outputs=[chatbot],
-            additional_outputs_handler=update_chatbot,
-            ui_args={"title": "Talk with Reachy Mini (Local Models)" if config.USE_LOCAL_MODELS else "Talk with Reachy Mini"},
-        )
-        stream_manager = stream.ui
+        # === CAMERA MONITOR INTERFACE (No audio streaming) ===
+        import cv2
+        import numpy as np
+        
+        with gr.Blocks(title="Reachy Mini Camera Monitor") as enhanced_ui:
+            gr.Markdown("# 🤖 Reachy Mini - Camera Monitor")
+            
+            with gr.Row():
+                # Camera feed (larger)
+                with gr.Column(scale=2):
+                    gr.Markdown("### 📹 Camera Feed")
+                    camera_display = gr.Image(type="numpy", height=480, interactive=False, show_label=False)
+                
+                # Conversation history
+                with gr.Column(scale=1):
+                    gr.Markdown("### 💬 Conversation History")
+                    history_display = gr.Textbox(lines=20, max_lines=20, interactive=False, show_label=False)
+                    
+                    refresh_btn = gr.Button("🔄 Refresh", size="sm")
+            
+            def get_camera():
+                if deps.camera_worker is None:
+                    return None
+                frame = deps.camera_worker.get_latest_frame()
+                if frame is None:
+                    return None
+                return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            def get_history():
+                if not hasattr(handler, 'conversation_history'):
+                    return "No history available"
+                history = handler.conversation_history[-10:]  # Show last 10 messages
+                lines = []
+                for msg in history:
+                    role = msg.get('role', '?')
+                    content = str(msg.get('content', ''))
+                    lines.append(f"{role}: {content}\n")
+                return "\n".join(lines) if lines else "No messages yet"
+            
+            def update_monitors():
+                return get_camera(), get_history()
+            
+            # Manual refresh button
+            refresh_btn.click(fn=update_monitors, outputs=[camera_display, history_display])
+            
+            # Auto-refresh using timer (0.1 seconds = 10 FPS for smooth camera feed)
+            timer = gr.Timer(value=0.1, active=True)
+            timer.tick(fn=update_monitors, outputs=[camera_display, history_display])
+        
+        stream_manager = enhanced_ui
+        # === END CAMERA MONITOR INTERFACE ===
+        
         if not settings_app:
             app = FastAPI()
         else:
             app = settings_app
 
-        personality_ui.wire_events(handler, stream_manager)
-
-        app = gr.mount_gradio_app(app, stream.ui, path="/")
+        app = gr.mount_gradio_app(app, stream_manager, path="/")
     else:
         # In headless mode, wire settings_app + instance_path to console LocalStream
         stream_manager = LocalStream(
@@ -202,6 +226,7 @@ def run(
             settings_app=settings_app,
             instance_path=instance_path,
         )
+        stream_manager.deps = deps
 
     # Start async services
     movement_manager.start()
