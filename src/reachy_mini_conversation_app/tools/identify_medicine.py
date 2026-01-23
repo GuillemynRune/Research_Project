@@ -37,7 +37,6 @@ class IdentifyMedicine(Tool):
         
         # Add delay for user to position medicine
         logger.info("Waiting 2 seconds for user to position medicine...")
-        await asyncio.sleep(2.0)
         
         frame = deps.camera_worker.get_latest_frame()
         if frame is None:
@@ -84,8 +83,8 @@ If you don't see any medicine, just say what you do see."""
                         ],
                         "stream": False,
                         "options": {
-                            "temperature": 0.7,
-                            "num_predict": 100,
+                            "temperature": 0.5,
+                            "num_predict": 75,
                         }
                     }
                 )

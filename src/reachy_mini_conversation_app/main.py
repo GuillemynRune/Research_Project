@@ -227,6 +227,8 @@ def run(
             instance_path=instance_path,
         )
         stream_manager.deps = deps
+        handler.deps.console_stream = stream_manager
+        object.__setattr__(deps, 'console_stream', stream_manager)
 
     # Start async services
     movement_manager.start()

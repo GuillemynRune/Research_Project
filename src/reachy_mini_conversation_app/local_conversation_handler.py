@@ -99,11 +99,15 @@ class LocalConversationHandler(AsyncStreamHandler):
         # Audio buffering for VADba
         self.audio_buffer: list = []
         self.buffer_duration_s = 0.0
-        self.silence_threshold = 0.03  # RMS threshold for silence detection
-        self.min_speech_duration = 0.5  # Minimum speech duration in seconds
-        self.max_speech_duration = 10.0  # Maximum speech duration
-        self.silence_duration_to_stop = 0.6  # Seconds of silence to stop recording
+        self.silence_threshold = 0.015  # RMS threshold for silence detection
+        self.min_speech_duration = 0.8  # Minimum speech duration in seconds
+        self.max_speech_duration = 15.0  # Maximum speech duration
+        self.silence_duration_to_stop = 1.0  # Seconds of silence to stop recording
         self._silence_start: Optional[float] = None
+
+        self._noise_floor = 0.01  # Estimated background noise level
+        self._recent_energy = []  # Track recent energy levels for adaptive threshold
+        self._max_recent_samples = 30  # Number of samples to track
 
         self._models_loaded = False
 
@@ -185,19 +189,36 @@ class LocalConversationHandler(AsyncStreamHandler):
                 await asyncio.sleep(1.0)
 
     def _is_silence(self, audio_chunk: NDArray[np.int16]) -> bool:
-        """Check if audio chunk is silence based on RMS threshold."""
+        """Check if audio chunk is silence using adaptive threshold."""
         audio_float = audio_chunk.astype(np.float32) / 32768.0
         rms = np.sqrt(np.mean(audio_float ** 2))
         
-        # Lower threshold = more sensitive (triggers on quieter sounds)
-        # Higher threshold = less sensitive (only triggers on louder sounds)
-        threshold = 0.008  # Adjust this if needed
-
+        # Track recent energy levels for adaptive threshold
+        self._recent_energy.append(rms)
+        if len(self._recent_energy) > self._max_recent_samples:
+            self._recent_energy.pop(0)
+        
+        # Adaptive threshold: noise floor + margin above recent average
+        if len(self._recent_energy) >= 5:
+            recent_avg = np.mean(self._recent_energy)
+            # Update noise floor slowly (low-pass filter)
+            self._noise_floor = 0.95 * self._noise_floor + 0.05 * recent_avg
+            # Threshold is noise floor + 50% margin
+            adaptive_threshold = self._noise_floor * 1.5
+        else:
+            adaptive_threshold = 0.015  # Default until we have enough samples
+        
+        # Clamp threshold to reasonable range
+        threshold = max(0.008, min(0.025, adaptive_threshold))
+        
         is_silent = rms < threshold
         
         # Log occasionally for debugging
-        if np.random.random() < 0.01:  # Log 1% of the time
-            logger.debug(f"Audio RMS: {rms:.4f} (threshold: {threshold}, silent: {is_silent})")
+        if np.random.random() < 0.02:  # Log 2% of the time
+            logger.debug(
+                f"Audio RMS: {rms:.4f} | Threshold: {threshold:.4f} | "
+                f"Noise floor: {self._noise_floor:.4f} | Silent: {is_silent}"
+            )
         
         return is_silent
 
@@ -224,7 +245,7 @@ class LocalConversationHandler(AsyncStreamHandler):
             audio_float = audio_data.astype(np.float32) / 32768.0
             rms = np.sqrt(np.mean(audio_float ** 2))
             
-            if rms < 0.01:
+            if rms < 0.008:
                 logger.info(f"🔇 Audio too quiet (RMS={rms:.4f}), skipping transcription")
                 self.is_processing = False
                 return
@@ -414,8 +435,9 @@ class LocalConversationHandler(AsyncStreamHandler):
         
         # WAKE WORD CHECK
         transcript_lower = transcript.lower()
-        wake_words = ["reachy", "richie", "reach", "reiki", "ricky", "reichy"]
-        
+        # Changed from "reachy" to "robot" with common variations
+        wake_words = ["robot", "robots", "robo", "roboto"]
+
         # Find where wake word appears
         wake_word_index = -1
         found_wake_word = None
@@ -424,28 +446,28 @@ class LocalConversationHandler(AsyncStreamHandler):
                 wake_word_index = transcript_lower.find(wake_word)
                 found_wake_word = wake_word
                 break
-        
+
         if wake_word_index == -1:
             logger.info(f"⏭️  No wake word: '{transcript}' - IGNORED")
             return ""
-        
+
         # IMPORTANT: Remove everything BEFORE the wake word
-        # This filters out the "Hey hey hey jump jump" nonsense
+        # This filters out unwanted pre-wake-word audio
         words = transcript.split()
         cleaned_words = []
         found = False
-        
+
         for word in words:
             if not found and any(ww in word.lower() for ww in wake_words):
                 found = True
             if found:
                 cleaned_words.append(word)
-        
+
         cleaned_transcript = " ".join(cleaned_words)
-        
+
         logger.info(f"✅ Wake word '{found_wake_word}' found")
         logger.info(f"📝 Cleaned: '{cleaned_transcript}'")
-        
+
         return cleaned_transcript
     
     def _clear_bad_history(self):
@@ -649,34 +671,33 @@ class LocalConversationHandler(AsyncStreamHandler):
         # Basic interaction examples
         if has_play_emotion:
             first_emotion = emotion_list.split(',')[0].strip()
-            examples.append(f'User: "Hello!"\nReachy: "Hi! I\'m Reachy! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
+            examples.append(f'User: "Hello!"\nrobot: "Hi! I\'m Reachy! [TOOL:play_emotion:{{\"emotion\":\"{first_emotion}\"}}]"')
         
         # Movement examples
         if has_move_head:
-            examples.append('User: "Look left"\nReachy: "Looking left now. [TOOL:move_head:{\\"direction\\":\\"left\\"}]"')
+            examples.append('User: "Look left"\nrobot: "Looking left now. [TOOL:move_head:{\\"direction\\":\\"left\\"}]"')
         
         if has_dance:
-            examples.append('User: "Dance for me"\nReachy: "I\'d love to dance! [TOOL:dance:{\\"move\\":\\"random\\",\\"repeat\\":1}]"')
+            examples.append('User: "Dance for me"\nrobot: "I\'d love to dance! [TOOL:dance:{\\"move\\":\\"random\\",\\"repeat\\":1}]"')
         
         # Timer/Reminder examples - CHANGED
         if has_create_timer:
-            examples.append('User: "Set a timer for 10 seconds"\nReachy: "Timer set! [TOOL:create_timer:{\\"duration\\":10,\\"unit\\":\\"seconds\\"}]"')
-            examples.append('User: "Set a timer for 5 minutes"\nReachy: "Timer set for 5 minutes! [TOOL:create_timer:{\\"duration\\":5,\\"unit\\":\\"minutes\\"}]"')
+            examples.append('User: "Set a timer for 10 seconds"\nrobot: "Timer set! [TOOL:create_timer:{\\"duration\\":10,\\"unit\\":\\"seconds\\"}]"')
+            examples.append('User: "Set a timer for 5 minutes"\nrobot: "Timer set for 5 minutes! [TOOL:create_timer:{\\"duration\\":5,\\"unit\\":\\"minutes\\"}]"')
         
         if has_create_reminder:
-            examples.append('User: "Remind me to stretch in 10 minutes"\nReachy: "I\'ll remind you to stretch! [TOOL:create_reminder:{\\"message\\":\\"stretch\\",\\"delay\\":10,\\"unit\\":\\"minutes\\"}]"')
-            examples.append('User: "Remind me about the meeting in 1 hour"\nReachy: "Got it! [TOOL:create_reminder:{\\"message\\":\\"meeting\\",\\"delay\\":1,\\"unit\\":\\"hours\\"}]"')
+            examples.append('User: "Remind me to stretch in 10 minutes"\nrobot: "I\'ll remind you to stretch! [TOOL:create_reminder:{\\"message\\":\\"stretch\\",\\"delay\\":10,\\"unit\\":\\"minutes\\"}]"')
+            examples.append('User: "Remind me about the meeting in 1 hour"\nrobot: "Got it! [TOOL:create_reminder:{\\"message\\":\\"meeting\\",\\"delay\\":1,\\"unit\\":\\"hours\\"}]"')
         
         # Camera example
         if has_camera:
-            examples.append('User: "What do you see?"\nReachy: "Let me look. [TOOL:camera:{\\"question\\":\\"what do you see?\\"}]"')
-
+            examples.append('User: "What do you see?"\nrobot: "Let me look. [TOOL:camera:{\\"question\\":\\"what do you see?\\"}]"')
         if "identify_medicine" in ALL_TOOLS:
-            examples.append('User: "Hey Reachy, identify this medicine"\nReachy: "Let me look at that. [TOOL:identify_medicine:{}]"')
-            examples.append('User: "What medication is this?"\nReachy: "Hold it up for me. [TOOL:identify_medicine:{}]"')
+            examples.append('User: "Hey robot, identify this medicine"\nrobot: "Let me look at that. [TOOL:identify_medicine:{}]"')
+            examples.append('User: "What medication is this?"\nrobot: "Hold it up for me. [TOOL:identify_medicine:{}]"')
         
         # General conversation example
-        examples.append('User: "Tell me a joke"\nReachy: "Why did the robot cross the playground? To get to the other slide!"')
+        examples.append('User: "Tell me a joke"\nrobot: "Why did the robot cross the playground? To get to the other slide!"')
         
         examples_text = "\n\n".join(examples)
         
@@ -885,6 +906,18 @@ class LocalConversationHandler(AsyncStreamHandler):
                 if tool_name == "identify_medicine" and "medicine_info" in result:
                     medicine_info = result["medicine_info"]
                     
+                    # Store for dashboard
+                    logger.info("💊 Storing medicine info for dashboard...")
+                    if hasattr(self.deps, 'console_stream') and self.deps.console_stream:
+                        from datetime import datetime
+                        self.deps.console_stream.latest_medicine = {
+                            "medicine_info": medicine_info,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        logger.info("✅ Medicine stored successfully for dashboard")
+                    else:
+                        logger.warning("⚠️ console_stream not available - medicine won't display on dashboard")
+                    
                     # Parse and format the response for speech
                     spoken_response = self._format_medicine_response(medicine_info)
                     
@@ -892,21 +925,21 @@ class LocalConversationHandler(AsyncStreamHandler):
                     logger.info(f"Speaking medicine info: {spoken_response}")
                     await self._generate_speech(spoken_response)
                     
-                    # Also output to chat
+                    # Output to console
                     await self.output_queue.put(
                         AdditionalOutputs({
                             "role": "assistant",
                             "content": spoken_response
                         })
                     )
-                
-                await self.output_queue.put(
-                    AdditionalOutputs({
-                        "role": "assistant",
-                        "content": json.dumps(result),
-                        "metadata": {"title": f"🛠️ Used tool {tool_name}", "status": "done"}
-                    })
-                )
+                    
+                    # Also send the raw data
+                    await self.output_queue.put(
+                        AdditionalOutputs({
+                            "role": "assistant",
+                            "content": json.dumps({"medicine_info": medicine_info})
+                        })
+                    )
                 
                 self.conversation_history.append({
                     "role": "system",

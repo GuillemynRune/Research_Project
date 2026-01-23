@@ -3,18 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Reachy Mini - Monitoring Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <title>Reachy Mini - Enhanced Dashboard</title>
     <style>
       body {
         margin: 0;
         padding: 20px;
         background: #0a0a0a;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+        color: #fff;
       }
       
       .dashboard-container {
-        max-width: 1600px;
+        max-width: 1800px;
         margin: 0 auto;
       }
       
@@ -29,7 +29,6 @@
       .dashboard-title {
         font-size: 28px;
         font-weight: 600;
-        color: #fff;
         margin: 0 0 8px 0;
       }
       
@@ -65,7 +64,6 @@
       .panel-title {
         font-size: 16px;
         font-weight: 600;
-        color: #fff;
         display: flex;
         align-items: center;
         gap: 8px;
@@ -207,29 +205,153 @@
         font-size: 14px;
       }
       
+      /* Timer/Reminder Cards */
+      .task-card {
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+      }
+      
+      .task-card.timer {
+        border-left: 4px solid #ff9500;
+      }
+      
+      .task-card.reminder {
+        border-left: 4px solid #00d9ff;
+      }
+      
+      .task-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      
+      .task-type {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      
+      .task-card.timer .task-type {
+        color: #ff9500;
+      }
+      
+      .task-card.reminder .task-type {
+        color: #00d9ff;
+      }
+      
+      .task-countdown {
+        font-size: 32px;
+        font-weight: 700;
+        text-align: center;
+        margin: 16px 0;
+        font-family: 'Monaco', 'Courier New', monospace;
+      }
+      
+      .task-card.timer .task-countdown {
+        color: #ff9500;
+      }
+      
+      .task-card.reminder .task-countdown {
+        color: #00d9ff;
+      }
+      
+      .task-message {
+        font-size: 14px;
+        color: #ccc;
+        margin-top: 8px;
+      }
+      
+      .task-progress {
+        height: 4px;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-top: 12px;
+      }
+      
+      .task-progress-bar {
+        height: 100%;
+        transition: width 0.3s ease;
+      }
+      
+      .task-card.timer .task-progress-bar {
+        background: linear-gradient(90deg, #ff9500, #ff6b00);
+      }
+      
+      .task-card.reminder .task-progress-bar {
+        background: linear-gradient(90deg, #00d9ff, #00a8cc);
+      }
+      
+      /* Medicine Display */
+      .medicine-card {
+        background: rgba(94, 240, 193, 0.05);
+        border-radius: 8px;
+        padding: 16px;
+        border: 1px solid rgba(94, 240, 193, 0.3);
+        margin-bottom: 12px;
+      }
+      
+      .medicine-title {
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: #5ef0c1;
+        margin-bottom: 12px;
+      }
+      
+      .medicine-field {
+        display: flex;
+        margin-bottom: 8px;
+      }
+      
+      .medicine-label {
+        font-weight: 600;
+        color: #5ef0c1;
+        min-width: 100px;
+        font-size: 13px;
+      }
+      
+      .medicine-value {
+        color: #e0e0e0;
+        font-size: 13px;
+      }
+      
+      /* System Logs */
       .log-entry {
         margin-bottom: 8px;
         padding: 8px 12px;
         background: rgba(255, 255, 255, 0.02);
         border-radius: 6px;
         font-family: 'Monaco', 'Courier New', monospace;
-        font-size: 12px;
+        font-size: 11px;
         border-left: 2px solid;
+        line-height: 1.4;
       }
       
-      .log-entry.info {
+      .log-entry.INFO {
         border-left-color: #00d9ff;
         color: #00d9ff;
       }
       
-      .log-entry.warning {
+      .log-entry.WARNING {
         border-left-color: #ff9500;
         color: #ff9500;
       }
       
-      .log-entry.error {
+      .log-entry.ERROR {
         border-left-color: #ff3b30;
         color: #ff3b30;
+      }
+      
+      .log-entry.DEBUG {
+        border-left-color: #888;
+        color: #888;
       }
       
       .log-timestamp {
@@ -294,14 +416,22 @@
         margin-bottom: 12px;
         opacity: 0.3;
       }
+      
+      /* Three column layout for bottom section */
+      .three-col-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 20px;
+        margin-bottom: 20px;
+      }
     </style>
   </head>
   <body>
     <div class="dashboard-container">
       <!-- Header -->
       <div class="dashboard-header">
-        <h1 class="dashboard-title">🤖 Reachy Mini Monitoring Dashboard</h1>
-        <p class="dashboard-subtitle">Real-time camera feed, conversation history, and system logs</p>
+        <h1 class="dashboard-title">🤖 Reachy Mini - Enhanced Dashboard</h1>
+        <p class="dashboard-subtitle">Real-time camera, timers, reminders, medicine ID, conversation & system logs</p>
       </div>
       
       <!-- Main Grid -->
@@ -338,8 +468,8 @@
                 <div class="stat-value" id="actual-fps">--</div>
               </div>
               <div class="stat-card">
-                <div class="stat-label">Connection</div>
-                <div class="stat-value" id="connection-status">Connected</div>
+                <div class="stat-label">Active Tasks</div>
+                <div class="stat-value" id="active-tasks">0</div>
               </div>
               <div class="stat-card">
                 <div class="stat-label">Uptime</div>
@@ -350,22 +480,33 @@
         </div>
       </div>
       
-      <!-- Bottom Grid -->
-      <div class="dashboard-grid">
-        <!-- Conversation History -->
+      <!-- Three Column Grid -->
+      <div class="three-col-grid">
+        <!-- Timers & Reminders -->
         <div class="panel">
           <div class="panel-header">
-            <div class="panel-title">💬 Conversation History</div>
-            <div class="button-group">
-              <button class="btn btn-secondary" id="refresh-btn">🔄 Refresh</button>
-              <button class="btn btn-danger" id="clear-history-btn">🗑️ Clear</button>
-            </div>
+            <div class="panel-title">⏰ Timers & Reminders</div>
           </div>
           <div class="panel-content">
-            <div class="scrollable-content" id="conversation-history">
+            <div class="scrollable-content" id="tasks-container">
               <div class="empty-state">
-                <div class="empty-state-icon">💬</div>
-                <p>No messages yet</p>
+                <div class="empty-state-icon">⏰</div>
+                <p>No active timers or reminders</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Medicine Identification -->
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">💊 Medicine Information</div>
+          </div>
+          <div class="panel-content">
+            <div class="scrollable-content" id="medicine-container">
+              <div class="empty-state">
+                <div class="empty-state-icon">💊</div>
+                <p>No medicine identified yet</p>
               </div>
             </div>
           </div>
@@ -375,14 +516,33 @@
         <div class="panel">
           <div class="panel-header">
             <div class="panel-title">📋 System Logs</div>
-            <button class="btn btn-secondary" id="clear-logs-btn">Clear</button>
+            <button class="btn btn-secondary" id="clear-logs-btn" style="font-size: 11px; padding: 6px 12px;">Clear</button>
           </div>
           <div class="panel-content">
             <div class="scrollable-content" id="system-logs">
               <div class="empty-state">
                 <div class="empty-state-icon">📋</div>
-                <p>No logs yet</p>
+                <p>Waiting for logs...</p>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Conversation History -->
+      <div class="panel">
+        <div class="panel-header">
+          <div class="panel-title">💬 Conversation History</div>
+          <div class="button-group">
+            <button class="btn btn-secondary" id="refresh-btn">🔄 Refresh</button>
+            <button class="btn btn-danger" id="clear-history-btn">🗑️ Clear</button>
+          </div>
+        </div>
+        <div class="panel-content">
+          <div class="scrollable-content" id="conversation-history">
+            <div class="empty-state">
+              <div class="empty-state-icon">💬</div>
+              <p>No messages yet</p>
             </div>
           </div>
         </div>

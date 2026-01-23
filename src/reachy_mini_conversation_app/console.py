@@ -15,6 +15,7 @@ import time
 import asyncio
 import logging
 import json
+from logging import Handler
 from typing import List, Optional
 from pathlib import Path
 
@@ -47,6 +48,26 @@ except Exception:  # pragma: no cover - only loaded when settings_app is used
 
 logger = logging.getLogger(__name__)
 
+class WebSocketLogHandler(Handler):
+    """Custom log handler that streams logs to WebSocket."""
+    
+    def __init__(self, websocket_callback):
+        super().__init__()
+        self.websocket_callback = websocket_callback
+        self.setFormatter(logging.Formatter('%(levelname)s | %(name)s | %(message)s'))
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Queue the log message to be sent
+            asyncio.create_task(self.websocket_callback({
+                "type": "log",
+                "level": record.levelname,
+                "message": msg
+            }))
+        except Exception:
+            pass
+
 
 class LocalStream:
     """LocalStream using Reachy Mini's recorder/player."""
@@ -66,6 +87,7 @@ class LocalStream:
         """
         self.handler = handler
         self._robot = robot
+        self.latest_medicine = None  # Store latest medicine identification
         self._stop_event = asyncio.Event()
         self._tasks: List[asyncio.Task[None]] = []
         # Allow the handler to flush the player queue when appropriate.
@@ -312,8 +334,29 @@ class LocalStream:
             """Stream camera frames via WebSocket for high FPS."""
             await websocket.accept()
             logger.info("WebSocket client connected")
+
+             # Create log queue for this connection
+            log_queue = asyncio.Queue()
+            
+            async def send_log(log_data):
+                await log_queue.put(log_data)
+            
+            # Add WebSocket log handler
+            ws_log_handler = WebSocketLogHandler(send_log)
+            ws_log_handler.setLevel(logging.INFO)
+            logging.getLogger().addHandler(ws_log_handler)
             
             try:
+                # Stream logs task
+                async def stream_logs():
+                    while True:
+                        log_data = await log_queue.get()
+                        try:
+                            await websocket.send_json(log_data)
+                        except:
+                            break
+                
+                log_task = asyncio.create_task(stream_logs())
                 # Start streaming task
                 stream_task = asyncio.create_task(self._stream_camera(websocket))
                 
@@ -333,6 +376,47 @@ class LocalStream:
                                     for msg in history
                                 ]
                                 await websocket.send_json({"type": "conversation", "messages": messages})
+                
+                        elif message.get('type') == 'get_medicine':
+                            logger.info("📡 Medicine data requested via WebSocket")
+                            if self.latest_medicine:
+                                logger.info(f"📤 Sending medicine to dashboard: {self.latest_medicine.get('medicine_info', '')[:50]}...")
+                                await websocket.send_json({
+                                    "type": "medicine",
+                                    "medicine": self.latest_medicine
+                                })
+                            else:
+                                logger.info("No medicine data available")
+                                await websocket.send_json({
+                                    "type": "medicine",
+                                    "medicine": None
+                                })
+                        
+                        
+                        elif message.get('type') == 'get_tasks':
+                            logger.info("📡 Tasks data requested")
+                            if hasattr(self.handler, 'task_manager') and self.handler.task_manager:
+                                active_tasks = self.handler.task_manager.get_active_tasks()
+                                tasks_data = []
+                                for task in active_tasks:
+                                    status = self.handler.task_manager.get_task_status(task.task_id)
+                                    if status:
+                                        from datetime import datetime
+                                        created_time = task.created_time
+                                        scheduled_time = task.scheduled_time
+                                        total_duration = (scheduled_time - created_time).total_seconds()
+                                        status['total_duration_seconds'] = total_duration
+                                        tasks_data.append(status)
+                                await websocket.send_json({
+                                    "type": "tasks",
+                                    "tasks": tasks_data
+                                })
+                            else:
+                                await websocket.send_json({
+                                    "type": "tasks",
+                                    "tasks": []
+                                })
+                                
                     except asyncio.TimeoutError:
                         # No message received, continue streaming
                         pass
@@ -344,6 +428,8 @@ class LocalStream:
             finally:
                 stream_task.cancel()
                 logger.info("WebSocket client disconnected")
+                log_task.cancel()
+                logging.getLogger().removeHandler(ws_log_handler)
 
         # GET /conversation_history -> get conversation messages
         @self._settings_app.get("/conversation_history")
