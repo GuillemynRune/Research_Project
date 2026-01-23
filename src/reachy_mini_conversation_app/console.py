@@ -378,15 +378,15 @@ class LocalStream:
                                 await websocket.send_json({"type": "conversation", "messages": messages})
                 
                         elif message.get('type') == 'get_medicine':
-                            logger.info("📡 Medicine data requested via WebSocket")
+                            logger.debug("📡 Medicine data requested via WebSocket")
                             if self.latest_medicine:
-                                logger.info(f"📤 Sending medicine to dashboard: {self.latest_medicine.get('medicine_info', '')[:50]}...")
+                                logger.debug(f"📤 Sending medicine to dashboard: {self.latest_medicine.get('medicine_info', '')[:50]}...")
                                 await websocket.send_json({
                                     "type": "medicine",
                                     "medicine": self.latest_medicine
                                 })
                             else:
-                                logger.info("No medicine data available")
+                                logger.debug("No medicine data available")
                                 await websocket.send_json({
                                     "type": "medicine",
                                     "medicine": None
@@ -394,7 +394,7 @@ class LocalStream:
                         
                         
                         elif message.get('type') == 'get_tasks':
-                            logger.info("📡 Tasks data requested")
+                            logger.debug("📡 Tasks data requested")
                             if hasattr(self.handler, 'task_manager') and self.handler.task_manager:
                                 active_tasks = self.handler.task_manager.get_active_tasks()
                                 tasks_data = []

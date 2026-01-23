@@ -99,10 +99,10 @@ class LocalConversationHandler(AsyncStreamHandler):
         # Audio buffering for VADba
         self.audio_buffer: list = []
         self.buffer_duration_s = 0.0
-        self.silence_threshold = 0.015  # RMS threshold for silence detection
-        self.min_speech_duration = 0.8  # Minimum speech duration in seconds
+        self.silence_threshold = 0.020  # RMS threshold for silence detection
+        self.min_speech_duration = 1.0  # Minimum speech duration in seconds
         self.max_speech_duration = 15.0  # Maximum speech duration
-        self.silence_duration_to_stop = 1.0  # Seconds of silence to stop recording
+        self.silence_duration_to_stop = 1.2  # Seconds of silence to stop recording
         self._silence_start: Optional[float] = None
 
         self._noise_floor = 0.01  # Estimated background noise level
@@ -245,7 +245,7 @@ class LocalConversationHandler(AsyncStreamHandler):
             audio_float = audio_data.astype(np.float32) / 32768.0
             rms = np.sqrt(np.mean(audio_float ** 2))
             
-            if rms < 0.008:
+            if rms < 0.012:
                 logger.info(f"🔇 Audio too quiet (RMS={rms:.4f}), skipping transcription")
                 self.is_processing = False
                 return
@@ -422,6 +422,10 @@ class LocalConversationHandler(AsyncStreamHandler):
                 language="en",
                 beam_size=1,          # ← OPTIMIZED (was 3)
                 vad_filter=True,
+                condition_on_previous_text=False,  # ← Prevents hallucinations
+                compression_ratio_threshold=2.4,    # ← Rejects nonsense
+                no_speech_threshold=0.6,           # ← Higher = stricter
+                temperature=0.0,
             )
             return " ".join([segment.text for segment in segments]).strip()
         

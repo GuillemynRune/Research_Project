@@ -35,9 +35,7 @@ class IdentifyMedicine(Tool):
             logger.error("Camera worker not available")
             return {"error": "Camera not available"}
         
-        # Add delay for user to position medicine
-        logger.info("Waiting 2 seconds for user to position medicine...")
-        
+        # Get the latest frame immediately (camera is already running at 30 FPS)
         frame = deps.camera_worker.get_latest_frame()
         if frame is None:
             logger.error("No camera frame available")
