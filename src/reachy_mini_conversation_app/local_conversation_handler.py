@@ -54,7 +54,7 @@ class LocalConversationHandler(AsyncStreamHandler):
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
 
-        self.tts_provider = os.getenv("TTS_PROVIDER", "pyttsx3")  # "pyttsx3" or "elevenlabs"
+        self.tts_provider = os.getenv("TTS_PROVIDER", "elevenlabs")  # "pyttsx3" or "elevenlabs"
         self.elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
         self.elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
         self.elevenlabs_model = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
